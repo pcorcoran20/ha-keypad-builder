@@ -31,6 +31,15 @@ Rules:
 - The "Muscovy Public License" is a joke. The real license lives in `LICENSE` at the repo root, never in the header.
   The project uses MIT (`LICENSE`, copyright "Patrick (pcorcoran20)"). Ask Patrick before changing it.
 
+## Releases
+
+Bump `version` in both `manifest.json` and `const.py` (const's VERSION also busts the panel's browser cache).
+Pushing a new manifest version to `main` makes the Release workflow create a `v<version>` GitHub release,
+which is what HACS shows as the version.
+
+Brand icons live in `custom_components/keypad_builder/brand/` (HA 2026.3+ loads them from there).
+The editable source is `brand/icon.svg` at the repo root.
+
 ## Development
 
 ```bash

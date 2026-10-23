@@ -1,4 +1,4 @@
-<p align="center"><img src="brand/icon.png" alt="Keypad Builder icon" width="128"></p>
+<p align="center"><img src="custom_components/keypad_builder/brand/icon.png" alt="Keypad Builder icon" width="128"></p>
 
 # 🎛️ Keypad Builder
 
