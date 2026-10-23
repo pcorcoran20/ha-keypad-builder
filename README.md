@@ -9,7 +9,8 @@ Pick a keypad → tap a button on the faceplate → choose what it does → **Sa
 ## What it does
 
 - Adds a **Keypad Builder** page to your sidebar (admins only)
-- Lists your Lutron keypads, grouped by area
+- Lists your Lutron keypads, grouped by room, with clean names ("Entry" instead of "Patrick's Office Entry Position 1 Keypad") and readable types like "Sunnata keypad"
+- Pick what to control from a searchable list you can filter by **room** and **type** (lights, shades, scenes…)
 - Shows each keypad as a faceplate you can click (raise/lower buttons sit side by side)
 - Lets you set separate actions for **pressed** and **released**
 - Each button + press/release is saved as a **normal Home Assistant automation**, so you can still see and edit it in *Settings → Automations*

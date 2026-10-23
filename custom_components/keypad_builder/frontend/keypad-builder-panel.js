@@ -101,6 +101,55 @@ function reconcileLayout(saved, buttons) {
 
 const cloneLayout = (l) => JSON.parse(JSON.stringify(l));
 
+const TYPE_LABELS = {
+  light: "💡 Lights",
+  switch: "🔌 Switches",
+  fan: "🌀 Fans",
+  cover: "🪟 Shades & covers",
+  scene: "🎬 Scenes",
+  script: "📜 Scripts",
+  automation: "🤖 Automations",
+  media_player: "🔊 Media players",
+  input_boolean: "✅ Toggle helpers",
+  group: "👥 Groups",
+  climate: "🌡️ Climate",
+  lock: "🔒 Locks",
+  sensor: "📈 Sensors",
+  binary_sensor: "🚪 Binary sensors",
+};
+const domainLabel = (domain) => TYPE_LABELS[domain] || pretty(domain);
+
+const LUTRON_TYPES = {
+  SunnataKeypad: "Sunnata keypad",
+  SunnataHybridKeypad: "Sunnata hybrid keypad",
+  SeeTouchKeypad: "seeTouch keypad",
+  SeeTouchTabletopKeypad: "seeTouch tabletop",
+  HomeownerKeypad: "Homeowner keypad",
+  PaddleSwitchPico: "Paddle Pico",
+  FourGroupRemote: "4-group remote",
+};
+
+// "RRST-W4B-XX (SunnataKeypad)" -> { type: "Sunnata keypad", code: "RRST-W4B-XX" }
+function friendlyModel(model) {
+  const m = /^(.*?)\s*\(([^)]+)\)\s*$/.exec(model || "");
+  const code = (m ? m[1] : model || "").trim();
+  const raw = m ? m[2] : "";
+  let type = LUTRON_TYPES[raw];
+  if (!type && /^Pico/.test(raw)) type = "Pico remote";
+  if (!type && raw) type = raw.replace(/([a-z])([A-Z])/g, "$1 $2");
+  return { type: type || "", code };
+}
+
+// Lutron names devices "<Room> <Location> Position <n> <Kind>". The room is already the
+// list heading, so show just the location ("Entry") and keep the position for gangs.
+function splitDeviceName(name, area) {
+  let rest = name;
+  if (area && rest.toLowerCase().startsWith(`${area.toLowerCase()} `)) rest = rest.slice(area.length + 1);
+  const m = /^(.*?)\s*\bPosition\s+(\d+)\s*(.*)$/i.exec(rest);
+  if (m) return { title: m[1] || m[3] || rest, position: Number(m[2]) };
+  return { title: rest || name, position: null };
+}
+
 function loadThemeMode() {
   try {
     const mode = localStorage.getItem(THEME_KEY);
@@ -350,14 +399,21 @@ class KeypadBuilderPanel extends HTMLElement {
     s.loading = true;
     this._render();
     try {
-      const [devices, areas, entries, layouts] = await Promise.all([
+      const [devices, areas, entries, layouts, entities] = await Promise.all([
         this._hass.callWS({ type: "config/device_registry/list" }),
         this._hass.callWS({ type: "config/area_registry/list" }),
         this._hass.callWS({ type: "config_entries/get", domain: DEFAULT_DOMAIN }).catch(() => []),
         this._hass.callWS({ type: "keypad_builder/layouts/get" }).catch(() => ({})),
+        this._hass.callWS({ type: "config/entity_registry/list" }).catch(() => []),
       ]);
       s.layouts = layouts || {};
       const areaName = Object.fromEntries(areas.map((a) => [a.area_id, a.name]));
+      // entity -> room, for the entity picker (entity's own room, else its device's room)
+      const deviceArea = Object.fromEntries(devices.map((d) => [d.id, d.area_id]));
+      this._areaName = areaName;
+      this._entityArea = Object.fromEntries(
+        entities.map((e) => [e.entity_id, e.area_id || deviceArea[e.device_id] || null])
+      );
       const entryIds = new Set(entries.map((e) => e.entry_id));
 
       let list = devices
@@ -367,7 +423,8 @@ class KeypadBuilderPanel extends HTMLElement {
           name: d.name_by_user || d.name || "Unnamed device",
           area: areaName[d.area_id] || "",
           model: d.model || "",
-        }));
+        }))
+        .map((d) => ({ ...d, ...splitDeviceName(d.name, d.area), ...friendlyModel(d.model) }));
 
       // For Lutron, only keep devices that actually have buttons.
       if (!s.allDevices) {
@@ -377,7 +434,16 @@ class KeypadBuilderPanel extends HTMLElement {
         list = checked.filter(Boolean);
       }
 
-      list.sort((a, b) => (a.area || "~").localeCompare(b.area || "~") || a.name.localeCompare(b.name));
+      list.sort(
+        (a, b) =>
+          (a.area || "~").localeCompare(b.area || "~") ||
+          a.title.localeCompare(b.title) ||
+          (a.position || 0) - (b.position || 0)
+      );
+      // only show "Pos 2" when a room has more than one device with the same name
+      const seen = {};
+      for (const d of list) seen[`${d.area}|${d.title}`] = (seen[`${d.area}|${d.title}`] || 0) + 1;
+      for (const d of list) d.showPosition = d.position != null && seen[`${d.area}|${d.title}`] > 1;
       s.devices = list;
     } catch (e) {
       s.msg = { type: "error", text: `Couldn't load devices: ${e.message || e}` };
@@ -693,10 +759,12 @@ class KeypadBuilderPanel extends HTMLElement {
         case "add":
           s.rows.push(newRow("homeassistant.toggle"));
           s.dirty = true;
+          s.msg = null;
           return this._render();
         case "remove":
           s.rows.splice(i, 1);
           s.dirty = true;
+          s.msg = null;
           return this._render();
         case "up":
         case "down": {
@@ -704,6 +772,7 @@ class KeypadBuilderPanel extends HTMLElement {
           if (j < 0 || j >= s.rows.length) return;
           [s.rows[i], s.rows[j]] = [s.rows[j], s.rows[i]];
           s.dirty = true;
+          s.msg = null;
           return this._render();
         }
         case "save":
@@ -715,6 +784,12 @@ class KeypadBuilderPanel extends HTMLElement {
           return this._loadDevices();
         case "theme":
           return this._cycleTheme();
+        case "pick":
+          return this._openPicker(el.dataset.pick);
+        case "pick-close":
+          return this._closePicker();
+        case "pick-choose":
+          return this._choose(el.dataset.entity);
         case "open-editor":
           return this._navigate(`/config/automation/edit/${encodeURIComponent(el.dataset.id)}`);
         case "led-save":
@@ -749,6 +824,10 @@ class KeypadBuilderPanel extends HTMLElement {
       }
     });
 
+    root.addEventListener("keydown", (ev) => {
+      if (ev.key === "Escape" && this._picker) this._closePicker();
+    });
+
     root.addEventListener("input", (ev) => {
       const el = ev.target;
       const s = this._s;
@@ -756,11 +835,13 @@ class KeypadBuilderPanel extends HTMLElement {
         s.filter = el.value;
         return this._renderDeviceList();
       }
+      if (el.id === "pick-q") {
+        this._picker.q = el.value;
+        return this._renderPickerList();
+      }
       if (el.dataset.ledField != null && el.tagName !== "SELECT") {
         s.led[el.dataset.ledField] = el.value;
         s.ledDirty = true;
-        const hint = root.querySelector("#hint-led");
-        if (hint && el.dataset.ledField === "entity") hint.textContent = this._entityName(el.value);
         return;
       }
       if (el.dataset.lkey != null) {
@@ -777,19 +858,20 @@ class KeypadBuilderPanel extends HTMLElement {
       if (!row) return;
       row[el.dataset.field] = el.value;
       s.dirty = true;
+      s.msg = null;
       if (el.dataset.field === "brightness") {
         const out = root.querySelector(`#bval-${el.dataset.row}`);
         if (out) out.textContent = `${el.value}%`;
-      }
-      if (el.dataset.field === "entity") {
-        const hint = root.querySelector(`#hint-${el.dataset.row}`);
-        if (hint) hint.textContent = this._entityName(el.value);
       }
     });
 
     root.addEventListener("change", (ev) => {
       const el = ev.target;
       const s = this._s;
+      if (el.id === "pick-area" || el.id === "pick-type") {
+        this._picker[el.id === "pick-area" ? "area" : "type"] = el.value;
+        return this._renderPickerList();
+      }
       if (el.id === "all-devices") {
         s.allDevices = el.checked;
         return this._loadDevices();
@@ -817,14 +899,10 @@ class KeypadBuilderPanel extends HTMLElement {
         else if ("entity" in row && old.entity) row.entity = old.entity;
         s.rows[i] = row;
         s.dirty = true;
+        s.msg = null;
         this._render();
       }
     });
-  }
-
-  _entityName(entityId) {
-    const st = this._hass.states[entityId];
-    return st ? st.attributes.friendly_name || entityId : entityId ? "⚠️ entity not found" : "";
   }
 
   // ---------- rendering ----------
@@ -860,8 +938,10 @@ class KeypadBuilderPanel extends HTMLElement {
         </section>
       </div>
       ${this._renderDatalists()}
+      ${this._renderPicker()}
     `;
     this._renderDeviceList();
+    this._renderPickerList();
     this._syncMenu();
     this._updateLeds();
   }
@@ -875,7 +955,7 @@ class KeypadBuilderPanel extends HTMLElement {
       return;
     }
     const q = s.filter.toLowerCase();
-    const list = s.devices.filter((d) => `${d.name} ${d.area} ${d.model}`.toLowerCase().includes(q));
+    const list = s.devices.filter((d) => `${d.name} ${d.area} ${d.model} ${d.type}`.toLowerCase().includes(q));
     if (!list.length) {
       box.innerHTML = s.devices.length
         ? `<p class="muted">No matches for that search.</p>`
@@ -888,7 +968,8 @@ class KeypadBuilderPanel extends HTMLElement {
         const header = d.area !== lastArea ? `<div class="area">${esc(d.area || "No area")}</div>` : "";
         lastArea = d.area;
         return `${header}<button class="dev ${d.id === s.deviceId ? "active" : ""}" data-act="device" data-id="${esc(d.id)}">
-          <span>${esc(d.name)}</span>${d.model ? `<small>${esc(d.model)}</small>` : ""}
+          <span class="dev-title" title="${esc(d.name)}">${esc(d.title)}${d.showPosition ? ` <span class="chip">Pos ${d.position}</span>` : ""}</span>
+          ${d.type || d.code ? `<small>${esc(d.type || d.code)}</small>` : ""}
         </button>`;
       })
       .join("");
@@ -928,8 +1009,8 @@ class KeypadBuilderPanel extends HTMLElement {
     return `
       <div class="card-head">
         <div>
-          <div class="device-name">${esc(device.name)}</div>
-          <div class="muted">${esc(device.area || "")}${device.model ? ` · ${esc(device.model)}` : ""}</div>
+          <div class="device-name" title="${esc(device.name)}">${esc(device.title)}${device.showPosition ? ` <span class="chip">Pos ${device.position}</span>` : ""}</div>
+          <div class="muted">${esc([device.area, device.type, device.code].filter(Boolean).join(" · "))}</div>
         </div>
         ${editing ? "" : `<button class="ghost" data-act="l-edit">✏️ Edit layout</button>`}
       </div>
@@ -1052,8 +1133,7 @@ class KeypadBuilderPanel extends HTMLElement {
     let body = "";
     if (led.mode === "follow") {
       body = `
-        <input class="grow" list="dl-any" placeholder="Device to follow, e.g. light.kitchen" value="${esc(led.entity)}" data-led-field="entity">
-        <div class="hint" id="hint-led">${esc(this._entityName(led.entity))}</div>
+        ${this._entityButton(led.entity, "led", "Choose what the LED follows…")}
         <div class="inline"><label>LED on when</label>
           <input placeholder="on" value="${esc(led.state)}" data-led-field="state">
         </div>
@@ -1121,8 +1201,7 @@ class KeypadBuilderPanel extends HTMLElement {
     if (row.kind === "service") {
       const preset = presetFor(row.service);
       body = `
-        <input class="grow" list="dl-${esc(preset.led ? "led" : preset.domains.join("-"))}" placeholder="Choose entity…" value="${esc(row.entity)}" data-row="${i}" data-field="entity">
-        <div class="hint" id="hint-${i}">${esc(this._entityName(row.entity))}</div>
+        ${this._entityButton(row.entity, `row-${i}`, preset.led ? "Choose a keypad LED…" : "Choose what to control…")}
         ${
           preset.brightness
             ? `<div class="inline">
@@ -1139,8 +1218,7 @@ class KeypadBuilderPanel extends HTMLElement {
     } else if (row.kind === "custom") {
       body = `
         <input class="grow" list="dl-services" placeholder="action, e.g. light.turn_on" value="${esc(row.service)}" data-row="${i}" data-field="service">
-        <input class="grow" list="dl-any" placeholder="entity (optional)" value="${esc(row.entity)}" data-row="${i}" data-field="entity">
-        <div class="hint" id="hint-${i}">${esc(this._entityName(row.entity))}</div>
+        ${this._entityButton(row.entity, `row-${i}`, "Entity (optional)…")}
         <textarea rows="3" placeholder='extra data as JSON, e.g. {"color_name": "pink"}' data-row="${i}" data-field="dataText">${esc(row.dataText)}</textarea>`;
     } else if (row.kind === "delay") {
       body = `<div class="inline"><label>Seconds</label>
@@ -1164,29 +1242,176 @@ class KeypadBuilderPanel extends HTMLElement {
   }
 
   _renderDatalists() {
-    const states = Object.values(this._hass.states);
-    const opt = (st) => `<option value="${esc(st.entity_id)}">${esc(st.attributes.friendly_name || "")}</option>`;
-    const lists = new Map();
-    for (const p of PRESETS) {
-      if (p.led) continue;
-      const id = p.domains.join("-");
-      if (lists.has(id)) continue;
-      const items = states.filter((st) => p.domains.includes(st.entity_id.split(".")[0]));
-      lists.set(id, `<datalist id="dl-${esc(id)}">${items.map(opt).join("")}</datalist>`);
-    }
     const services = Object.entries(this._hass.services || {}).flatMap(([d, svcs]) =>
       Object.keys(svcs).map((svc) => `<option value="${esc(`${d}.${svc}`)}"></option>`)
     );
-    // keypad LEDs: this keypad's first, then anything else that looks like one
-    const ownLeds = new Set(this._s.buttons.map((b) => b.ledEntity).filter(Boolean));
-    const leds = [
-      ...states.filter((st) => ownLeds.has(st.entity_id)),
-      ...states.filter((st) => !ownLeds.has(st.entity_id) && st.entity_id.startsWith("switch.") && /\bled\b/i.test(`${st.entity_id.replace(/_/g, " ")} ${st.attributes.friendly_name || ""}`)),
-    ];
-    return `${[...lists.values()].join("")}
-      <datalist id="dl-led">${leds.map(opt).join("")}</datalist>
-      <datalist id="dl-any">${states.map(opt).join("")}</datalist>
-      <datalist id="dl-services">${services.join("")}</datalist>`;
+    return `<datalist id="dl-services">${services.join("")}</datalist>`;
+  }
+
+  // ---------- entity picker ----------
+
+  _areaOf(entityId) {
+    return this._areaName?.[this._entityArea?.[entityId]] || "";
+  }
+
+  _entityButton(value, pickId, placeholder) {
+    const st = this._hass.states[value];
+    const meta = [this._areaOf(value), value].filter(Boolean).join(" · ") + (value && !st ? " · ⚠️ not found" : "");
+    return `<button class="entity-field ${value ? "" : "empty"}" data-act="pick" data-pick="${esc(pickId)}">
+      <span class="ef-text">
+        <span class="ef-name">${esc(value ? st?.attributes.friendly_name || value : placeholder)}</span>
+        ${value ? `<span class="ef-meta">${esc(meta)}</span>` : ""}
+      </span>
+      <span class="ef-chev">▾</span>
+    </button>`;
+  }
+
+  _openPicker(pickId) {
+    const s = this._s;
+    let domains = null;
+    let led = false;
+    let value = "";
+    if (pickId === "led") {
+      value = s.led?.entity || "";
+    } else {
+      const row = s.rows[Number(pickId.slice(4))];
+      if (!row) return;
+      value = row.entity || "";
+      const preset = row.kind === "service" ? presetFor(row.service) : null;
+      led = !!preset?.led;
+      domains = preset && !led ? preset.domains : null;
+    }
+    this._picker = { pickId, domains, led, value, q: "", area: "", type: "" };
+    this._render();
+    this.shadowRoot.querySelector("#pick-q")?.focus();
+  }
+
+  _closePicker() {
+    this._picker = null;
+    this._render();
+  }
+
+  _choose(entityId) {
+    const s = this._s;
+    const { pickId } = this._picker;
+    if (pickId === "led") {
+      s.led.entity = entityId;
+      s.ledDirty = true;
+    } else {
+      s.rows[Number(pickId.slice(4))].entity = entityId;
+      s.dirty = true;
+      s.msg = null;
+    }
+    this._closePicker();
+  }
+
+  // Everything this field could pick from, before the room/type/search filters.
+  _pickerCandidates() {
+    const p = this._picker;
+    const states = Object.values(this._hass.states);
+    if (p.led) {
+      // keypad LEDs: this keypad's first, then anything else that looks like one
+      const own = new Set(this._s.buttons.map((b) => b.ledEntity).filter(Boolean));
+      return states.filter(
+        (st) =>
+          own.has(st.entity_id) ||
+          (st.entity_id.startsWith("switch.") && /\bled\b/i.test(`${st.entity_id.replace(/_/g, " ")} ${st.attributes.friendly_name || ""}`))
+      );
+    }
+    if (p.domains) return states.filter((st) => p.domains.includes(st.entity_id.split(".")[0]));
+    return states;
+  }
+
+  _renderPicker() {
+    const p = this._picker;
+    if (!p) return "";
+    const candidates = this._pickerCandidates();
+    const rooms = new Map();
+    let noRoom = false;
+    const types = new Set();
+    for (const st of candidates) {
+      const areaId = this._entityArea?.[st.entity_id];
+      if (areaId && this._areaName?.[areaId]) rooms.set(areaId, this._areaName[areaId]);
+      else noRoom = true;
+      types.add(st.entity_id.split(".")[0]);
+    }
+    const roomOptions = [...rooms.entries()]
+      .sort((a, b) => a[1].localeCompare(b[1]))
+      .map(([id, name]) => `<option value="${esc(id)}" ${p.area === id ? "selected" : ""}>${esc(name)}</option>`)
+      .join("");
+    const typeOptions = [...types]
+      .sort((a, b) => domainLabel(a).replace(/^\W+/, "").localeCompare(domainLabel(b).replace(/^\W+/, "")))
+      .map((t) => `<option value="${esc(t)}" ${p.type === t ? "selected" : ""}>${esc(domainLabel(t))}</option>`)
+      .join("");
+    const title = p.led ? "Choose a keypad LED" : p.pickId === "led" ? "What should the LED follow?" : "Choose what to control";
+
+    return `
+      <div class="picker-backdrop" data-act="pick-close"></div>
+      <div class="picker" role="dialog" aria-label="${esc(title)}">
+        <div class="picker-head">
+          <h3>${esc(title)}</h3>
+          <button class="icon" data-act="pick-close" title="Close">✕</button>
+        </div>
+        <input id="pick-q" type="search" placeholder="Search by name…" value="${esc(p.q)}" autocomplete="off">
+        <div class="picker-filters">
+          <select id="pick-area" aria-label="Room">
+            <option value="">🏠 All rooms</option>
+            ${roomOptions}
+            ${noRoom ? `<option value="__none" ${p.area === "__none" ? "selected" : ""}>No room</option>` : ""}
+          </select>
+          ${
+            types.size > 1
+              ? `<select id="pick-type" aria-label="Type"><option value="">✨ All types</option>${typeOptions}</select>`
+              : ""
+          }
+        </div>
+        <div id="pick-list" class="pick-list"></div>
+        ${p.value ? `<div class="picker-foot"><button class="ghost" data-act="pick-choose" data-entity="">Clear selection</button></div>` : ""}
+      </div>`;
+  }
+
+  _renderPickerList() {
+    const p = this._picker;
+    const box = this.shadowRoot.querySelector("#pick-list");
+    if (!p || !box) return;
+    const words = p.q.toLowerCase().split(/\s+/).filter(Boolean);
+    const items = this._pickerCandidates()
+      .map((st) => ({
+        id: st.entity_id,
+        name: st.attributes.friendly_name || st.entity_id,
+        domain: st.entity_id.split(".")[0],
+        areaId: this._entityArea?.[st.entity_id] || null,
+        area: this._areaOf(st.entity_id),
+        state: st.state,
+      }))
+      .filter((e) => !p.type || e.domain === p.type)
+      .filter((e) => !p.area || (p.area === "__none" ? !e.area : e.areaId === p.area))
+      .filter((e) => {
+        const hay = `${e.name} ${e.id} ${e.area}`.toLowerCase();
+        return words.every((w) => hay.includes(w));
+      })
+      .sort((a, b) => (a.area || "~").localeCompare(b.area || "~") || a.name.localeCompare(b.name));
+
+    if (!items.length) {
+      box.innerHTML = `<p class="muted center">Nothing matches 🥲 Try another room, type or search.</p>`;
+      return;
+    }
+    const LIMIT = 250;
+    let lastArea = null;
+    box.innerHTML =
+      items
+        .slice(0, LIMIT)
+        .map((e) => {
+          const header = e.area !== lastArea ? `<div class="area">${esc(e.area || "No room")}</div>` : "";
+          lastArea = e.area;
+          return `${header}<button class="pick-item ${e.id === p.value ? "active" : ""}" data-act="pick-choose" data-entity="${esc(e.id)}">
+            <span class="pi-text"><span class="pi-name">${esc(e.name)}</span>
+            <span class="pi-meta">${esc(domainLabel(e.domain))} · ${esc(e.id)}</span></span>
+            <span class="pi-state">${esc(e.state)}</span>
+          </button>`;
+        })
+        .join("") +
+      (items.length > LIMIT ? `<p class="muted center">Showing ${LIMIT} of ${items.length}. Search or filter to narrow it down.</p>` : "");
   }
 }
 
@@ -1270,6 +1495,45 @@ const STYLES = `
   .dev:hover { background: var(--kb-border); }
   .dev.active { border-color: var(--kb-accent); background: color-mix(in srgb, var(--kb-accent) 12%, transparent); }
   .device-name { font-weight: 600; font-size: 17px; }
+  .dev-title { font-weight: 500; }
+  .chip {
+    display: inline-block; font-size: 11px; font-weight: 500; padding: 1px 7px; border-radius: 999px;
+    background: color-mix(in srgb, var(--kb-accent) 16%, transparent); color: var(--kb-text); vertical-align: middle;
+  }
+
+  /* ---- entity picker ---- */
+  .entity-field {
+    display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+    background: var(--kb-input); border: 1px solid var(--kb-border); border-radius: 10px; padding: 8px 10px;
+  }
+  .entity-field:hover { border-color: var(--kb-accent); }
+  .entity-field.empty .ef-name { color: var(--kb-muted); }
+  .ef-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .ef-name, .pi-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ef-meta, .pi-meta { font-size: 12px; color: var(--kb-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ef-chev { color: var(--kb-muted); }
+  .picker-backdrop { position: fixed; inset: 0; background: rgba(0, 0, 0, .45); z-index: 10; }
+  .picker {
+    position: fixed; z-index: 11; left: 50%; top: 50%; translate: -50% -50%;
+    width: min(560px, calc(100vw - 32px)); max-height: min(720px, calc(100vh - 48px));
+    display: flex; flex-direction: column; gap: 10px; padding: 16px;
+    background: var(--kb-card); color: var(--kb-text); border: 1px solid var(--kb-border); border-radius: var(--kb-radius);
+    box-shadow: 0 20px 60px rgba(0, 0, 0, .35);
+  }
+  .picker-head { display: flex; align-items: center; justify-content: space-between; }
+  .picker-filters { display: flex; gap: 8px; flex-wrap: wrap; }
+  .picker-filters select { flex: 1; min-width: 160px; }
+  .pick-list { overflow-y: auto; min-height: 120px; display: flex; flex-direction: column; gap: 2px; }
+  .pick-list .area { margin-top: 10px; }
+  .pick-item {
+    display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+    background: none; border: 1px solid transparent; border-radius: 10px; padding: 8px 10px;
+  }
+  .pick-item:hover { background: var(--kb-border); }
+  .pick-item.active { border-color: var(--kb-accent); background: color-mix(in srgb, var(--kb-accent) 12%, transparent); }
+  .pi-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .pi-state { font-size: 12px; color: var(--kb-muted); flex: none; }
+  .picker-foot { display: flex; justify-content: flex-end; }
   .source { margin-top: 10px; font-size: 12px; color: var(--kb-muted); }
 
   /* ---- faceplate ---- */
