@@ -12,6 +12,8 @@
 
 """Tests for keeping Keypad Builder automations organized."""
 
+from unittest.mock import patch
+
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import (
     area_registry as ar,
@@ -122,4 +124,65 @@ async def test_organize_command(hass: HomeAssistant, hass_ws_client) -> None:
     client = await hass_ws_client(hass)
     await client.send_json_auto_id({"type": "keypad_builder/organize"})
     result = (await client.receive_json())["result"]
-    assert result == [{"id": created.unique_id, "entity_id": created.entity_id, "device_id": device.id}]
+    assert result == [{"id": created.unique_id, "entity_id": created.entity_id, "device_id": device.id, "shared": False}]
+
+
+async def _shared_automation(hass: HomeAssistant, unique_id: str, devices: list[dr.DeviceEntry]) -> str:
+    """Load a real automation whose triggers are buttons on several keypads."""
+    triggers = [
+        {"trigger": "device", "domain": "lutron_caseta", "device_id": d.id, "type": "press", "subtype": "Bright"}
+        for d in devices
+    ]
+    with patch(
+        "homeassistant.components.device_automation.trigger.async_validate_trigger_config",
+        side_effect=lambda hass, config: config,
+    ):
+        assert await async_setup_component(
+            hass,
+            "automation",
+            {"automation": [{"id": unique_id, "alias": "Movie time", "triggers": triggers, "actions": []}]},
+        )
+        await hass.async_block_till_done()
+    return er.async_get(hass).async_get_entity_id("automation", "automation", unique_id)
+
+
+def _two_keypads(hass: HomeAssistant, area_a: str, area_b: str) -> list[dr.DeviceEntry]:
+    lutron = MockConfigEntry(domain="lutron_caseta")
+    lutron.add_to_hass(hass)
+    registry = dr.async_get(hass)
+    return [
+        registry.async_update_device(
+            registry.async_get_or_create(config_entry_id=lutron.entry_id, identifiers={("lutron_caseta", name)}).id,
+            area_id=area,
+        )
+        for name, area in (("a", area_a), ("b", area_b))
+    ]
+
+
+async def test_shared_action_in_one_room_gets_that_area(hass: HomeAssistant, hass_ws_client) -> None:
+    office = ar.async_get(hass).async_create("Patrick's Office")
+    devices = _two_keypads(hass, office.id, office.id)
+    entity_id = await _shared_automation(hass, "keypad_builder_shared_movie_time_ab12", devices)
+    await _setup(hass)
+
+    entry = er.async_get(hass).async_get(entity_id)
+    assert entry.area_id == office.id
+    assert _category_name(hass, entry) == CATEGORY_NAME
+    assert _label_names(hass, entry) == {LABEL_NAME}
+
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id({"type": "keypad_builder/automations"})
+    assert (await client.receive_json())["result"] == [
+        {"id": "keypad_builder_shared_movie_time_ab12", "entity_id": entity_id, "device_id": None, "shared": True}
+    ]
+
+
+async def test_shared_action_across_rooms_gets_no_area(hass: HomeAssistant) -> None:
+    areas = ar.async_get(hass)
+    devices = _two_keypads(hass, areas.async_create("Office").id, areas.async_create("Bedroom").id)
+    entity_id = await _shared_automation(hass, "keypad_builder_shared_all_off_cd34", devices)
+    await _setup(hass)
+
+    entry = er.async_get(hass).async_get(entity_id)
+    assert entry.area_id is None
+    assert _category_name(hass, entry) == CATEGORY_NAME
