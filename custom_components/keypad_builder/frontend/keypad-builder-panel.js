@@ -13,12 +13,16 @@ const PRESETS = [
   { service: "light.turn_on", label: "Set light brightness", domains: ["light"], brightness: true },
   { service: "scene.turn_on", label: "Activate scene", domains: ["scene"] },
   { service: "script.turn_on", label: "Run script", domains: ["script"] },
+  { service: "automation.trigger", label: "Run another automation", domains: ["automation"] },
   { service: "cover.open_cover", label: "Open shade", domains: ["cover"] },
   { service: "cover.close_cover", label: "Close shade", domains: ["cover"] },
   { service: "cover.stop_cover", label: "Stop shade", domains: ["cover"] },
   { service: "media_player.media_play_pause", label: "Play / pause", domains: ["media_player"] },
   { service: "media_player.volume_up", label: "Volume up", domains: ["media_player"] },
   { service: "media_player.volume_down", label: "Volume down", domains: ["media_player"] },
+  { service: "switch.turn_on", label: "Keypad LED on", domains: ["switch"], led: true },
+  { service: "switch.turn_off", label: "Keypad LED off", domains: ["switch"], led: true },
+  { service: "switch.toggle", label: "Keypad LED toggle", domains: ["switch"], led: true },
 ];
 
 const esc = (v) =>
@@ -32,6 +36,8 @@ const pretty = (v) =>
 const typeLabel = (t) => ({ press: "When pressed", release: "When released" })[t] || `When ${pretty(t).toLowerCase()}`;
 
 const autoId = (deviceId, subtype, type) => `${ID_PREFIX}_${deviceId}_${slug(subtype)}_${slug(type)}`;
+const ledId = (deviceId, subtype) => `${ID_PREFIX}_${deviceId}_${slug(subtype)}_led`;
+const isOurs = (id) => String(id || "").startsWith(`${ID_PREFIX}_`);
 
 const presetFor = (service) => PRESETS.find((p) => p.service === service);
 
@@ -190,6 +196,18 @@ function buildAction(row, index) {
   return out;
 }
 
+// LED automations we write look like: state trigger on a source entity -> if on, LED on, else LED off.
+function parseLed(config) {
+  if (!config) return { mode: "lutron", entity: "", state: "on" };
+  const trigger = [].concat(config.triggers ?? config.trigger ?? []).find((t) => (t.trigger || t.platform) === "state" && t.entity_id);
+  const action = [].concat(config.actions ?? config.action ?? [])[0];
+  const cond = action?.if?.[0];
+  if (trigger && cond?.state != null && action.then && action.else) {
+    return { mode: "follow", entity: [].concat(trigger.entity_id)[0], state: String(cond.state) };
+  }
+  return { mode: "custom", entity: "", state: "on" };
+}
+
 function newRow(kind) {
   if (kind === "delay") return { kind: "delay", seconds: 1 };
   if (kind === "custom") return { kind: "custom", service: "", entity: "", dataText: "" };
@@ -203,6 +221,11 @@ class KeypadBuilderPanel extends HTMLElement {
     this._triggerCache = new Map();
     this._themeMode = loadThemeMode();
     this._s = {
+      ledConfigs: {},
+      led: null,
+      ledDirty: false,
+      ledMsg: null,
+      related: [],
       layouts: {},
       info: null,
       layout: null,
@@ -235,6 +258,26 @@ class KeypadBuilderPanel extends HTMLElement {
       this._loadDevices();
     }
     this._syncMenu();
+    this._updateLeds();
+  }
+
+  // Light up faceplate LEDs from the live LED switch states (no full re-render).
+  _updateLeds() {
+    for (const el of this.shadowRoot.querySelectorAll("[data-led-entity]")) {
+      const on = this._hass.states[el.dataset.ledEntity]?.state === "on";
+      el.classList.toggle("lit", on);
+    }
+    const label = this.shadowRoot.querySelector("#led-state");
+    if (label) {
+      const st = this._hass.states[label.dataset.ledEntity]?.state;
+      label.textContent = st === "on" ? "currently on" : st === "off" ? "currently off" : "";
+    }
+  }
+
+  _navigate(path) {
+    if (!this._okToLeave()) return;
+    history.pushState(null, "", path);
+    window.dispatchEvent(new CustomEvent("location-changed", { detail: { replace: false } }));
   }
 
   get hass() {
@@ -348,6 +391,11 @@ class KeypadBuilderPanel extends HTMLElement {
       layout: null,
       layoutDraft: null,
       editingLayout: false,
+      ledConfigs: {},
+      led: null,
+      ledDirty: false,
+      ledMsg: null,
+      related: [],
     });
     this._render();
 
@@ -367,22 +415,29 @@ class KeypadBuilderPanel extends HTMLElement {
       s.info = info;
       const order = new Map((info?.buttons || []).map((b, i) => [String(b.subtype), { ...b, index: i }]));
       s.buttons = [...groups.values()]
-        .map((b, i) => ({ ...b, number: order.get(b.key)?.number, led: !!order.get(b.key)?.led, index: order.get(b.key)?.index ?? 1000 + i }))
+        .map((b, i) => ({
+          ...b,
+          number: order.get(b.key)?.number,
+          led: !!order.get(b.key)?.led,
+          ledEntity: order.get(b.key)?.led_entity_id || null,
+          index: order.get(b.key)?.index ?? 1000 + i,
+        }))
         .sort((a, b) => a.index - b.index);
       s.layout = reconcileLayout(s.layouts[deviceId] || autoLayout(s.buttons), s.buttons);
 
-      await Promise.all(
-        s.buttons.flatMap((b) =>
-          Object.keys(b.triggers).map(async (type) => {
-            const id = autoId(deviceId, b.subtype, type);
-            try {
-              s.configs[id] = await this._hass.callApi("GET", `config/automation/config/${id}`);
-            } catch (e) {
-              // 404 = no automation for this button yet, totally fine
-            }
-          })
-        )
-      );
+      const load = async (id, into) => {
+        try {
+          into[id] = await this._hass.callApi("GET", `config/automation/config/${id}`);
+        } catch (e) {
+          // 404 = nothing saved for this yet, totally fine
+        }
+      };
+      const [related] = await Promise.all([
+        this._hass.callWS({ type: "keypad_builder/button_automations", device_id: deviceId }).catch(() => []),
+        ...s.buttons.flatMap((b) => Object.keys(b.triggers).map((type) => load(autoId(deviceId, b.subtype, type), s.configs))),
+        ...s.buttons.filter((b) => b.ledEntity).map((b) => load(ledId(deviceId, b.subtype), s.ledConfigs)),
+      ]);
+      s.related = (related || []).filter((r) => !isOurs(r.id));
     } catch (e) {
       s.msg = { type: "error", text: `Couldn't load buttons: ${e.message || e}` };
     }
@@ -392,10 +447,15 @@ class KeypadBuilderPanel extends HTMLElement {
 
   _selectButton(key, type) {
     const s = this._s;
-    if ((key !== s.sel || type !== s.type) && !this._okToLeave()) return;
+    if (key !== s.sel ? !this._okToLeave() : type !== s.type && s.dirty && !confirm("You have unsaved changes for this button. Leave without saving?")) return;
     const button = s.buttons.find((b) => b.key === key);
     if (!button) return;
     const types = Object.keys(button.triggers);
+    if (key !== s.sel) {
+      s.led = parseLed(s.ledConfigs[ledId(s.deviceId, button.subtype)]);
+      s.ledDirty = false;
+      s.ledMsg = null;
+    }
     s.sel = key;
     s.type = type && types.includes(type) ? type : types.includes("press") ? "press" : types[0];
     const config = s.configs[autoId(s.deviceId, button.subtype, s.type)];
@@ -407,7 +467,83 @@ class KeypadBuilderPanel extends HTMLElement {
   }
 
   _okToLeave() {
-    return !this._s.dirty || confirm("You have unsaved changes for this button. Leave without saving?");
+    return (!this._s.dirty && !this._s.ledDirty) || confirm("You have unsaved changes for this button. Leave without saving?");
+  }
+
+  _relatedFor(button, type) {
+    return this._s.related.filter((r) => r.triggers.some((t) => String(t.subtype) === button.key && (!type || t.type === type)));
+  }
+
+  async _saveLed() {
+    const s = this._s;
+    const cur = this._current();
+    const button = cur?.button;
+    if (!button?.ledEntity) return;
+    const id = ledId(s.deviceId, button.subtype);
+    const led = s.led;
+
+    if (led.mode === "lutron") {
+      if (s.ledConfigs[id]) return this._removeLed();
+      s.ledDirty = false;
+      return this._render();
+    }
+    const source = (led.entity || "").trim();
+    if (!source) {
+      s.ledMsg = { type: "error", text: "Pick which device the LED should follow 💛" };
+      return this._render();
+    }
+    const onState = (led.state || "on").trim();
+    const device = s.devices.find((d) => d.id === s.deviceId);
+    const existing = s.ledConfigs[id] || {};
+    const config = {
+      ...existing,
+      alias: existing.alias || `Keypad LED · ${device?.name || "Keypad"} · ${this._layoutLabel(button.key)}`,
+      description: existing.description ?? "Made with Keypad Builder 🎛️",
+      mode: "restart",
+      triggers: [
+        { trigger: "state", entity_id: source },
+        { trigger: "homeassistant", event: "start" },
+      ],
+      conditions: existing.conditions ?? [],
+      actions: [
+        {
+          if: [{ condition: "state", entity_id: source, state: onState }],
+          then: [{ action: "switch.turn_on", target: { entity_id: button.ledEntity } }],
+          else: [{ action: "switch.turn_off", target: { entity_id: button.ledEntity } }],
+        },
+      ],
+    };
+    for (const k of ["id", "trigger", "condition", "action"]) delete config[k];
+
+    try {
+      await this._hass.callApi("POST", `config/automation/config/${id}`, config);
+      s.ledConfigs[id] = { ...config, id };
+      s.ledDirty = false;
+      s.ledMsg = { type: "ok", text: "LED saved! 💡" };
+      // sync the LED right away instead of waiting for the next change
+      const on = this._hass.states[source]?.state === onState;
+      await this._hass.callService("switch", on ? "turn_on" : "turn_off", { entity_id: button.ledEntity }).catch(() => {});
+    } catch (e) {
+      s.ledMsg = { type: "error", text: `Save failed: ${e.body?.message || e.message || e}` };
+    }
+    this._render();
+  }
+
+  async _removeLed() {
+    const s = this._s;
+    const button = this._current()?.button;
+    const id = ledId(s.deviceId, button.subtype);
+    if (!confirm("Stop controlling this LED? Lutron will be in charge of it again.")) return;
+    try {
+      await this._hass.callApi("DELETE", `config/automation/config/${id}`);
+      delete s.ledConfigs[id];
+      s.led = parseLed(null);
+      s.ledDirty = false;
+      s.ledMsg = { type: "ok", text: "Done, Lutron controls this LED again." };
+    } catch (e) {
+      s.ledMsg = { type: "error", text: `Remove failed: ${e.body?.message || e.message || e}` };
+    }
+    this._render();
   }
 
   // ---------- layout ----------
@@ -567,6 +703,12 @@ class KeypadBuilderPanel extends HTMLElement {
           return this._loadDevices();
         case "theme":
           return this._cycleTheme();
+        case "open-editor":
+          return this._navigate(`/config/automation/edit/${encodeURIComponent(el.dataset.id)}`);
+        case "led-save":
+          return this._saveLed();
+        case "led-remove":
+          return this._removeLed();
         case "l-edit":
           return this._editLayout();
         case "l-cancel":
@@ -602,6 +744,13 @@ class KeypadBuilderPanel extends HTMLElement {
         s.filter = el.value;
         return this._renderDeviceList();
       }
+      if (el.dataset.ledField != null && el.tagName !== "SELECT") {
+        s.led[el.dataset.ledField] = el.value;
+        s.ledDirty = true;
+        const hint = root.querySelector("#hint-led");
+        if (hint && el.dataset.ledField === "entity") hint.textContent = this._entityName(el.value);
+        return;
+      }
       if (el.dataset.lkey != null) {
         const key = el.dataset.lkey;
         const value = el.value.trim();
@@ -633,6 +782,11 @@ class KeypadBuilderPanel extends HTMLElement {
         s.allDevices = el.checked;
         return this._loadDevices();
       }
+      if (el.dataset.ledField === "mode") {
+        s.led.mode = el.value;
+        s.ledDirty = true;
+        return this._render();
+      }
       if (el.dataset.lhide != null) {
         const key = el.dataset.lhide;
         return this._changeLayout((d) => {
@@ -647,7 +801,8 @@ class KeypadBuilderPanel extends HTMLElement {
         const old = s.rows[i];
         const row = newRow(el.value);
         // keep the chosen entity when switching between similar actions
-        if ("entity" in row && old.entity) row.entity = old.entity;
+        if (presetFor(el.value)?.led) row.entity = this._current()?.button.ledEntity || "";
+        else if ("entity" in row && old.entity) row.entity = old.entity;
         s.rows[i] = row;
         s.dirty = true;
         this._render();
@@ -696,6 +851,7 @@ class KeypadBuilderPanel extends HTMLElement {
     `;
     this._renderDeviceList();
     this._syncMenu();
+    this._updateLeds();
   }
 
   _renderDeviceList() {
@@ -738,11 +894,12 @@ class KeypadBuilderPanel extends HTMLElement {
 
     const btn = (b, small) => {
       const has = Object.keys(b.triggers).some((t) => s.configs[autoId(s.deviceId, b.subtype, t)]);
+      const other = !has && this._relatedFor(b).length > 0;
       const hidden = layout.hidden.includes(b.key);
       const label = this._layoutLabel(b.key, layout);
-      const cls = ["kbtn", small && "small", b.key === s.sel && !editing && "active", has && "has", hidden && "is-hidden", b.led && "with-led"];
+      const cls = ["kbtn", small && "small", b.key === s.sel && !editing && "active", has && "has", other && "has-other", hidden && "is-hidden", b.led && "with-led"];
       return `<button class="${cls.filter(Boolean).join(" ")}" data-act="button" data-key="${esc(b.key)}" title="${esc(label)}">
-        ${b.led ? `<span class="led"></span>` : ""}<span class="label">${esc(label)}</span><span class="dot"></span>
+        ${b.led ? `<span class="led" ${b.ledEntity ? `data-led-entity="${esc(b.ledEntity)}"` : ""}></span>` : ""}<span class="label">${esc(label)}</span><span class="dot"></span>
       </button>`;
     };
 
@@ -769,7 +926,9 @@ class KeypadBuilderPanel extends HTMLElement {
       ${
         editing
           ? this._renderLayoutEditor(layout, byKey)
-          : `<div class="muted center legend"><span class="dot on"></span> has an automation</div>`
+          : `<div class="muted center legend"><span><span class="dot on"></span> set up here</span>${
+              s.related.length ? `<span><span class="dot other"></span> used by another automation</span>` : ""
+            }</div>`
       }
     `;
   }
@@ -853,7 +1012,86 @@ class KeypadBuilderPanel extends HTMLElement {
         ${s.dirty ? `<span class="muted">unsaved changes</span>` : ""}
         <button class="primary" data-act="save" ${s.busy ? "disabled" : ""}>${s.busy ? "Saving…" : "Save"}</button>
       </div>
+      ${
+        exists
+          ? `<div class="advanced">Want conditions, choose blocks or other fancy stuff?
+              <button class="link" data-act="open-editor" data-id="${esc(cur.id)}">Open in HA automation editor ↗</button>
+              <div class="muted">Changes you make there show up here too.</div></div>`
+          : ""
+      }
+      ${this._renderLedSection(cur.button)}
+      ${this._renderRelated(cur.button)}
     `;
+  }
+
+  _renderLedSection(button) {
+    const s = this._s;
+    if (!button.ledEntity || !s.led) return "";
+    const led = s.led;
+    const saved = !!s.ledConfigs[ledId(s.deviceId, button.subtype)];
+    const modes = [
+      ["lutron", "What Lutron programmed (default)"],
+      ["follow", "Whether a device is on"],
+      ...(led.mode === "custom" ? [["custom", "Custom (edited in HA)"]] : []),
+    ]
+      .map(([v, l]) => `<option value="${v}" ${v === led.mode ? "selected" : ""}>${esc(l)}</option>`)
+      .join("");
+
+    let body = "";
+    if (led.mode === "follow") {
+      body = `
+        <input class="grow" list="dl-any" placeholder="Device to follow, e.g. light.kitchen" value="${esc(led.entity)}" data-led-field="entity">
+        <div class="hint" id="hint-led">${esc(this._entityName(led.entity))}</div>
+        <div class="inline"><label>LED on when</label>
+          <input placeholder="on" value="${esc(led.state)}" data-led-field="state">
+        </div>
+        <div class="muted">Most things use <b>on</b>. Shades use <b>open</b>, locks use <b>locked</b>.</div>`;
+    } else if (led.mode === "custom") {
+      body = `<div class="muted">This LED automation was changed in HA's editor, so it's managed there.
+        <button class="link" data-act="open-editor" data-id="${esc(ledId(s.deviceId, button.subtype))}">Open it ↗</button></div>`;
+    }
+
+    return `
+      <div class="section">
+        <h3>💡 LED <span class="muted" id="led-state" data-led-entity="${esc(button.ledEntity)}"></span></h3>
+        <div class="inline"><label>LED shows</label><select data-led-field="mode">${modes}</select></div>
+        ${body}
+        <div class="muted">Heads up: your RA3 processor can still change this LED too, like when a Lutron scene runs. You can also turn LEDs on/off from any button with the “Keypad LED” actions.</div>
+        ${s.ledMsg ? `<div class="msg ${s.ledMsg.type}">${esc(s.ledMsg.text)}</div>` : ""}
+        ${
+          led.mode === "custom"
+            ? ""
+            : `<div class="footer">
+                ${saved ? `<button class="danger" data-act="led-remove">Stop controlling</button>` : ""}
+                <span class="spacer"></span>
+                ${s.ledDirty ? `<span class="muted">unsaved</span>` : ""}
+                <button class="primary" data-act="led-save">Save LED</button>
+              </div>`
+        }
+      </div>`;
+  }
+
+  _renderRelated(button) {
+    const list = this._relatedFor(button);
+    if (!list.length) return "";
+    return `
+      <div class="section">
+        <h3>🔗 Other automations using this button</h3>
+        <div class="muted">Made outside Keypad Builder. They run too when the button is used.</div>
+        ${list
+          .map((r) => {
+            const types = [...new Set(r.triggers.filter((t) => String(t.subtype) === button.key).map((t) => typeLabel(t.type).replace("When ", "")))];
+            return `<div class="related">
+              <div><div>${esc(r.name)}</div><div class="muted">${esc(types.join(", "))}</div></div>
+              ${
+                r.id
+                  ? `<button class="link" data-act="open-editor" data-id="${esc(r.id)}">Open ↗</button>`
+                  : `<span class="muted" title="Automations written in YAML without an id can't open in the editor">YAML only</span>`
+              }
+            </div>`;
+          })
+          .join("")}
+      </div>`;
   }
 
   _renderRow(row, i) {
@@ -871,7 +1109,7 @@ class KeypadBuilderPanel extends HTMLElement {
     if (row.kind === "service") {
       const preset = presetFor(row.service);
       body = `
-        <input class="grow" list="dl-${esc(preset.domains.join("-"))}" placeholder="Choose entity…" value="${esc(row.entity)}" data-row="${i}" data-field="entity">
+        <input class="grow" list="dl-${esc(preset.led ? "led" : preset.domains.join("-"))}" placeholder="Choose entity…" value="${esc(row.entity)}" data-row="${i}" data-field="entity">
         <div class="hint" id="hint-${i}">${esc(this._entityName(row.entity))}</div>
         ${
           preset.brightness
@@ -918,6 +1156,7 @@ class KeypadBuilderPanel extends HTMLElement {
     const opt = (st) => `<option value="${esc(st.entity_id)}">${esc(st.attributes.friendly_name || "")}</option>`;
     const lists = new Map();
     for (const p of PRESETS) {
+      if (p.led) continue;
       const id = p.domains.join("-");
       if (lists.has(id)) continue;
       const items = states.filter((st) => p.domains.includes(st.entity_id.split(".")[0]));
@@ -926,7 +1165,14 @@ class KeypadBuilderPanel extends HTMLElement {
     const services = Object.entries(this._hass.services || {}).flatMap(([d, svcs]) =>
       Object.keys(svcs).map((svc) => `<option value="${esc(`${d}.${svc}`)}"></option>`)
     );
+    // keypad LEDs: this keypad's first, then anything else that looks like one
+    const ownLeds = new Set(this._s.buttons.map((b) => b.ledEntity).filter(Boolean));
+    const leds = [
+      ...states.filter((st) => ownLeds.has(st.entity_id)),
+      ...states.filter((st) => !ownLeds.has(st.entity_id) && st.entity_id.startsWith("switch.") && /\bled\b/i.test(`${st.entity_id.replace(/_/g, " ")} ${st.attributes.friendly_name || ""}`)),
+    ];
     return `${[...lists.values()].join("")}
+      <datalist id="dl-led">${leds.map(opt).join("")}</datalist>
       <datalist id="dl-any">${states.map(opt).join("")}</datalist>
       <datalist id="dl-services">${services.join("")}</datalist>`;
   }
@@ -947,6 +1193,7 @@ const STYLES = `
     --kb-on-accent: var(--text-primary-color, #fff);
     --kb-on: var(--success-color, #43a047);
     --kb-error: var(--error-color, #db4437);
+    --kb-other: var(--info-color, #039be5);
     --kb-radius: 14px;
 
     display: block;
@@ -1049,12 +1296,26 @@ const STYLES = `
     position: absolute; left: 8px; top: 50%; translate: 0 -50%;
     width: 4px; height: 12px; border-radius: 2px; background: color-mix(in srgb, var(--fp-text) 30%, transparent);
   }
+  .kbtn .led.lit {
+    background: #ffd76a; box-shadow: 0 0 6px 2px rgba(255, 200, 80, .75);
+  }
+  .kbtn.has-other .dot { background: var(--kb-other); }
   .pair { display: flex; gap: 8px; }
   .kbtn.small { min-height: 34px; padding: 4px 16px; font-size: 11px; }
   .kbtn.small.with-led { padding-left: 18px; padding-right: 14px; letter-spacing: .04em; }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: transparent; vertical-align: middle; }
   .dot.on { background: var(--kb-on); }
-  .legend { margin-top: 4px; }
+  .dot.other { background: var(--kb-other); }
+  .legend { margin-top: 4px; display: flex; flex-wrap: wrap; justify-content: center; gap: 4px 14px; }
+
+  /* ---- extra editor sections ---- */
+  .section { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--kb-border); display: flex; flex-direction: column; gap: 8px; }
+  h3 { margin: 0; font-size: 16px; font-weight: 600; display: flex; align-items: baseline; gap: 8px; }
+  .section .footer { margin-top: 4px; }
+  .advanced { margin-top: 12px; font-size: 14px; }
+  .link { background: none; border: none; padding: 0; color: var(--kb-accent); font-weight: 500; }
+  .link:hover { text-decoration: underline; }
+  .related { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 10px; border: 1px solid var(--kb-border); border-radius: 10px; }
 
   /* ---- layout editor ---- */
   .layout-editor { display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--kb-border); padding-top: 12px; }

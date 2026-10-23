@@ -1,14 +1,22 @@
 {
   "domain": "keypad_builder",
   "name": "Keypad Builder",
+  "after_dependencies": [
+    "automation",
+    "lutron_caseta"
+  ],
   "codeowners": [],
   "config_flow": true,
-  "dependencies": ["http", "frontend", "panel_custom"],
+  "dependencies": [
+    "http",
+    "frontend",
+    "panel_custom"
+  ],
   "documentation": "https://github.com/OWNER/ha-keypad-builder",
   "integration_type": "service",
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/OWNER/ha-keypad-builder/issues",
   "requirements": [],
   "single_config_entry": true,
-  "version": "0.2.0"
+  "version": "0.3.0"
 }

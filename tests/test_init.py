@@ -1,9 +1,11 @@
 """Tests for setup, layouts and Lutron info."""
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -79,7 +81,11 @@ async def test_lutron_info(hass: HomeAssistant, hass_ws_client) -> None:
     )
     lutron_entry = MockConfigEntry(domain="lutron_caseta")
     lutron_entry.add_to_hass(hass)
-    lutron_entry.runtime_data = SimpleNamespace(keypad_data=keypad_data)
+    lutron_entry.runtime_data = SimpleNamespace(keypad_data=keypad_data, bridge_device={"serial": 1234})
+    # LED switch for button 1, registered the way lutron_caseta does it: "<hex bridge serial>_<led id>"
+    er.async_get(hass).async_get_or_create(
+        "switch", "lutron_caseta", "000004d2_501", suggested_object_id="kitchen_welcome_led", config_entry=lutron_entry
+    )
 
     client = await hass_ws_client(hass)
 
@@ -87,9 +93,9 @@ async def test_lutron_info(hass: HomeAssistant, hass_ws_client) -> None:
     result = (await client.receive_json())["result"]
     assert result["model"] == "HRST-W4B"
     assert result["buttons"] == [
-        {"subtype": "Welcome", "number": 1, "led": True},
-        {"subtype": "Dinner", "number": 2, "led": False},
-        {"subtype": "Raise", "number": 18, "led": False},
+        {"subtype": "Welcome", "number": 1, "led": True, "led_entity_id": "switch.kitchen_welcome_led"},
+        {"subtype": "Dinner", "number": 2, "led": False, "led_entity_id": None},
+        {"subtype": "Raise", "number": 18, "led": False, "led_entity_id": None},
     ]
 
     # Picos use HA's fixed button names, in physical order
@@ -99,3 +105,49 @@ async def test_lutron_info(hass: HomeAssistant, hass_ws_client) -> None:
 
     await client.send_json_auto_id({"type": "keypad_builder/lutron_info", "device_id": "unknown"})
     assert (await client.receive_json())["result"] is None
+
+
+async def test_button_automations(hass: HomeAssistant, hass_ws_client) -> None:
+    await _setup(hass)
+    other = MockConfigEntry(domain="test")
+    other.add_to_hass(hass)
+    device = dr.async_get(hass).async_get_or_create(config_entry_id=other.entry_id, identifiers={("test", "kp")})
+
+    def device_trigger(subtype):
+        return {"trigger": "device", "domain": "test", "device_id": device.id, "type": "press", "subtype": subtype}
+
+    def event_trigger():
+        return {"trigger": "event", "event_type": "x"}
+
+    # automations only remember referenced devices for device triggers/actions,
+    # so reference the device in an action and put the button in a device trigger
+    act = [{"device_id": device.id, "domain": "test", "type": "turn_on", "entity_id": "light.x"}]
+    hass.config.components.add("test")
+    with patch(
+        "homeassistant.components.device_automation.trigger.async_validate_trigger_config",
+        side_effect=lambda hass, config: config,
+    ), patch(
+        "homeassistant.components.device_automation.action.async_validate_action_config",
+        side_effect=lambda hass, config: config,
+    ):
+        assert await async_setup_component(
+            hass,
+            "automation",
+            {
+                "automation": [
+                    {"id": "mine", "alias": "Old dinner", "triggers": [device_trigger("Dinner")], "actions": act},
+                    {"id": "keypad_builder_x_dinner_press", "alias": "Ours", "triggers": [device_trigger("Dinner")], "actions": act},
+                    {"id": "unrelated", "alias": "Unrelated", "triggers": [event_trigger()], "actions": act},
+                ]
+            },
+        )
+        await hass.async_block_till_done()
+
+    client = await hass_ws_client(hass)
+    await client.send_json_auto_id({"type": "keypad_builder/button_automations", "device_id": device.id})
+    result = (await client.receive_json())["result"]
+    by_id = {r["id"]: r for r in result}
+    assert by_id["mine"]["triggers"] == [{"type": "press", "subtype": "Dinner"}]
+    assert by_id["mine"]["name"] == "Old dinner"
+    assert "keypad_builder_x_dinner_press" in by_id  # the panel filters its own out
+    assert "unrelated" not in by_id
