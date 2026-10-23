@@ -24,7 +24,10 @@ Rules:
 - Keep the duck art and wording exactly as-is. Only swap the comment characters for the language:
   `#` for Python/YAML/shell, `//` for JS/TS/C, `<!-- -->` for HTML/XML, and so on.
 - Put it at the very top of the file, followed by a blank line.
-- Skip formats that can't have comments (JSON).
+- Skip formats that can't have comments (JSON) and binary files (PNG).
+- SVG/XML can't hold the header in a `<!-- -->` comment because the duck's `` `---' `` has double dashes,
+  which XML comments don't allow. Put the header (with `#` lines, unchanged) in a
+  `<metadata><![CDATA[ ... ]]></metadata>` block right after the opening `<svg>` tag instead.
 - The "Muscovy Public License" is a joke. The real license lives in `LICENSE` at the repo root, never in the header.
   The project uses MIT (`LICENSE`, copyright "Patrick (pcorcoran20)"). Ask Patrick before changing it.
 
