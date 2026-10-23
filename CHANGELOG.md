@@ -2,6 +2,16 @@
 
 Release notes for each version. The Release workflow copies the matching section into the GitHub release, which is what HACS shows as the "release announcement".
 
+## v0.6.2
+
+Same features as v0.6.1, just some repo housekeeping 🧹
+
+- Added a contributing guide (`CONTRIBUTING.md`) with the file header rules and release steps
+- No changes to the integration itself, so updating is optional
+
+### ⬆️ Updating
+HACS → Keypad Builder → Update → restart Home Assistant
+
 ## v0.6.1
 
 First proper release of Keypad Builder 🎛️🦆
