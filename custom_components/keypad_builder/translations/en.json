@@ -1,0 +1,13 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Keypad Builder",
+        "description": "Adds a Keypad Builder page to your sidebar so you can design keypad button automations visually."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Keypad Builder is already set up."
+    }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "domain": "keypad_builder",
+  "name": "Keypad Builder",
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": ["http", "frontend", "panel_custom"],
+  "documentation": "https://github.com/OWNER/ha-keypad-builder",
+  "integration_type": "service",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/OWNER/ha-keypad-builder/issues",
+  "requirements": [],
+  "single_config_entry": true,
+  "version": "0.1.0"
+}
