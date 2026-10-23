@@ -67,3 +67,7 @@ Automation IDs look like `keypad_builder_<device id>_<button>_<press|release|led
 pip install pytest-homeassistant-custom-component pylutron-caseta
 pytest
 ```
+
+## License
+
+MIT, see [LICENSE](LICENSE). (The Muscovy Public License in the file headers is just a joke 🦆)

@@ -26,7 +26,7 @@ Rules:
 - Put it at the very top of the file, followed by a blank line.
 - Skip formats that can't have comments (JSON).
 - The "Muscovy Public License" is a joke. The real license lives in `LICENSE` at the repo root, never in the header.
-  If there's no `LICENSE` file yet, ask Patrick which license to use before creating one.
+  The project uses MIT (`LICENSE`, copyright "Patrick (pcorcoran20)"). Ask Patrick before changing it.
 
 ## Development
 
