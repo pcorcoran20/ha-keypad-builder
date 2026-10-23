@@ -13,7 +13,7 @@
 """Constants for Keypad Builder."""
 
 DOMAIN = "keypad_builder"
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 PANEL_URL_PATH = "keypad-builder"
 PANEL_TITLE = "Keypad Builder"
