@@ -11,7 +11,8 @@
 # ─────────────────────────────────────────────
 
 # Makes a GitHub release whenever the version in manifest.json goes up,
-# so HACS shows real version numbers and release notes.
+# so HACS shows real version numbers. Notes come from that version's
+# section in CHANGELOG.md (and get refreshed if the changelog changes).
 name: Release
 
 on:
@@ -19,6 +20,7 @@ on:
     branches: [main]
     paths:
       - custom_components/keypad_builder/manifest.json
+      - CHANGELOG.md
   workflow_dispatch:
 
 permissions:
@@ -34,13 +36,23 @@ jobs:
         id: version
         run: echo "tag=v$(jq -r .version custom_components/keypad_builder/manifest.json)" >> "$GITHUB_OUTPUT"
 
-      - name: Create release if it's new
+      - name: Pull notes from CHANGELOG.md
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          # everything under "## <tag>" up to the next "## " heading
+          awk -v tag="## $TAG" '$0 == tag {on=1; next} /^## / {on=0} on' CHANGELOG.md > notes.md
+          echo "Notes for $TAG:" && cat notes.md
+
+      - name: Create or update the release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
         run: |
           if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "$TAG already released"
+            if [ -s notes.md ]; then gh release edit "$TAG" --notes-file notes.md; fi
+          elif [ -s notes.md ]; then
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --notes-file notes.md
           else
             gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --generate-notes
           fi

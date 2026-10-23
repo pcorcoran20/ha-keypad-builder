@@ -33,7 +33,7 @@ Rules:
 
 ## Releases
 
-Bump `version` in both `manifest.json` and `const.py` (const's VERSION also busts the panel's browser cache).
+Add a `## v<version>` section to `CHANGELOG.md`, then bump `version` in both `manifest.json` and `const.py` (const's VERSION also busts the panel's browser cache).
 Pushing a new manifest version to `main` makes the Release workflow create a `v<version>` GitHub release,
 which is what HACS shows as the version.
 
