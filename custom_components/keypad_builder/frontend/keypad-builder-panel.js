@@ -48,6 +48,16 @@ const pretty = (v) =>
 const typeLabel = (t) => ({ press: "When pressed", release: "When released" })[t] || `When ${pretty(t).toLowerCase()}`;
 
 const autoId = (deviceId, subtype, type) => `${ID_PREFIX}_${deviceId}_${slug(subtype)}_${slug(type)}`;
+// Names that sort nicely in HA's automation list: "Patrick's Office · Entry · Bright · pressed"
+function makeAlias(device, label, kind) {
+  const what = kind === "led" ? "LED" : typeLabel(kind).replace(/^When /, "");
+  return [device?.area, device?.title || device?.name || "Keypad", label, what].filter(Boolean).join(" · ");
+}
+
+// Names made before 0.5: "Keypad · <device> · <label> (<Type>)" and "Keypad LED · <device> · <label>"
+const OLD_ALIAS = /^Keypad( LED)? · (.+) · (.+?)(?: \(([^)]+)\))?$/;
+const keepAlias = (alias) => (alias && !OLD_ALIAS.test(alias) ? alias : null);
+
 const ledId = (deviceId, subtype) => `${ID_PREFIX}_${deviceId}_${slug(subtype)}_led`;
 const isOurs = (id) => String(id || "").startsWith(`${ID_PREFIX}_`);
 
@@ -548,6 +558,49 @@ class KeypadBuilderPanel extends HTMLElement {
     return (!this._s.dirty && !this._s.ledDirty) || confirm("You have unsaved changes for this button. Leave without saving?");
   }
 
+  // Organize every Keypad Builder automation (backend sets area/category/label),
+  // and give automations from older versions the new name style.
+  async _tidyUp() {
+    const s = this._s;
+    if (
+      !confirm(
+        "Tidy up all Keypad Builder automations?\n\nEach one gets its keypad's area, the “Keypads” category and a “Keypad Builder” label. Older ones get the new name style. Names, areas and categories you changed yourself are kept."
+      )
+    )
+      return;
+    s.tidyMsg = { type: "ok", text: "Tidying up… 🧹" };
+    this._render();
+    try {
+      const list = await this._hass.callWS({ type: "keypad_builder/organize" });
+      let renamed = 0;
+      for (const item of list) {
+        let config;
+        try {
+          config = await this._hass.callApi("GET", `config/automation/config/${item.id}`);
+        } catch (e) {
+          continue;
+        }
+        const old = OLD_ALIAS.exec(config.alias || "");
+        const device = s.devices.find((d) => d.id === item.device_id);
+        if (!old || !device) continue;
+        const alias = makeAlias(device, old[3], old[1] ? "led" : slug(old[4] || "press"));
+        const { id, ...rest } = config;
+        await this._hass.callApi("POST", `config/automation/config/${item.id}`, { ...rest, alias });
+        for (const cache of [s.configs, s.ledConfigs]) if (cache[item.id]) cache[item.id].alias = alias;
+        renamed++;
+      }
+      s.tidyMsg = {
+        type: "ok",
+        text: list.length
+          ? `All ${list.length} automations organized ✨${renamed ? ` (${renamed} renamed)` : ""}`
+          : "No Keypad Builder automations yet 🫧",
+      };
+    } catch (e) {
+      s.tidyMsg = { type: "error", text: `Tidy up failed: ${e.message || e}` };
+    }
+    this._render();
+  }
+
   _relatedFor(button, type) {
     return this._s.related.filter((r) => r.triggers.some((t) => String(t.subtype) === button.key && (!type || t.type === type)));
   }
@@ -575,7 +628,7 @@ class KeypadBuilderPanel extends HTMLElement {
     const existing = s.ledConfigs[id] || {};
     const config = {
       ...existing,
-      alias: existing.alias || `Keypad LED · ${device?.name || "Keypad"} · ${this._layoutLabel(button.key)}`,
+      alias: keepAlias(existing.alias) || makeAlias(device, button.label, "led"),
       description: existing.description ?? "Made with Keypad Builder 🎛️",
       mode: "restart",
       triggers: [
@@ -690,7 +743,7 @@ class KeypadBuilderPanel extends HTMLElement {
 
     const config = {
       ...existing,
-      alias: existing.alias || `Keypad · ${device?.name || "Keypad"} · ${cur.button.label} (${pretty(s.type)})`,
+      alias: keepAlias(existing.alias) || makeAlias(device, cur.button.label, s.type),
       description: existing.description ?? "Made with Keypad Builder 🎛️",
       mode: existing.mode || "single",
       triggers: [trigger],
@@ -779,6 +832,8 @@ class KeypadBuilderPanel extends HTMLElement {
           return this._save();
         case "delete":
           return this._delete();
+        case "tidy":
+          return this._tidyUp();
         case "reload":
           this._triggerCache.clear();
           return this._loadDevices();
@@ -922,10 +977,14 @@ class KeypadBuilderPanel extends HTMLElement {
         <section class="card devices">
           <div class="card-head">
             <h2>Keypads</h2>
-            <button class="icon" data-act="reload" title="Reload">↻</button>
+            <span>
+              <button class="icon" data-act="tidy" title="Tidy up automations: area, category, label and names">🧹</button>
+              <button class="icon" data-act="reload" title="Reload">↻</button>
+            </span>
           </div>
           <input id="search" type="search" placeholder="Search keypads…" value="${esc(s.filter)}">
           <label class="check"><input id="all-devices" type="checkbox" ${s.allDevices ? "checked" : ""}> Show devices from all integrations</label>
+          ${s.tidyMsg ? `<div class="msg ${s.tidyMsg.type}">${esc(s.tidyMsg.text)}</div>` : ""}
           <div id="devlist"></div>
         </section>
 

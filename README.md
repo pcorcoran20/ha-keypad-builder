@@ -20,6 +20,7 @@ Pick a keypad → tap a button on the faceplate → choose what it does → **Sa
 - 💡 **LED control:** make a button's LED follow any device (like "LED on when the kitchen lights are on"), or turn LEDs on/off as button actions. Faceplate LEDs glow live in the panel
 - 🔧 **Works with HA's automation editor:** open any button's automation in the full HA editor to add conditions or fancy steps, and Keypad Builder keeps them
 - 🔗 **Existing automations:** fire any automation you already have from a button ("Run another automation"), and see which other automations already use each button (blue dot), with links to open them
+- 🗂️ **Organized automations:** each one gets its keypad's **area**, a **Keypads** category and a **Keypad Builder** label, plus names that sort nicely ("Patrick's Office · Entry · Bright · pressed"). If a keypad moves rooms, its automations follow. Tap 🧹 to tidy up ones made with older versions
 - 🌙 **Dark mode:** follows your HA theme automatically, or tap the 🌗 button to force light/dark
 
 ### Actions you can pick

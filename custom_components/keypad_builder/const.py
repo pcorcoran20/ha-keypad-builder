@@ -13,7 +13,7 @@
 """Constants for Keypad Builder."""
 
 DOMAIN = "keypad_builder"
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 PANEL_URL_PATH = "keypad-builder"
 PANEL_TITLE = "Keypad Builder"
@@ -24,3 +24,9 @@ STATIC_URL = "/keypad_builder_static"
 
 STORAGE_KEY = "keypad_builder.layouts"
 STORAGE_VERSION = 1
+
+CATEGORY_NAME = "Keypads"
+CATEGORY_ICON = "mdi:gesture-tap-button"
+LABEL_NAME = "Keypad Builder"
+LABEL_ICON = "mdi:gesture-tap-button"
+LABEL_COLOR = "amber"
