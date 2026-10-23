@@ -1,0 +1,46 @@
+# ─────────────────────────────────────────────
+#        ,,
+#      <(@@)___     Patrick's nest
+#       ( ._> /     quackomation for the homelab
+#        `---'      hatched with love, waddles on HA
+#
+#  Muscovy Public License (a joke, not a license)
+#  real one's in the LICENSE file. no feathers
+#  were ruffled. this duck is legally un-binding
+#  but will absolutely imprint on you.
+# ─────────────────────────────────────────────
+
+# Makes a GitHub release whenever the version in manifest.json goes up,
+# so HACS shows real version numbers and release notes.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - custom_components/keypad_builder/manifest.json
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        run: echo "tag=v$(jq -r .version custom_components/keypad_builder/manifest.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Create release if it's new
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "$TAG already released"
+          else
+            gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --generate-notes
+          fi
