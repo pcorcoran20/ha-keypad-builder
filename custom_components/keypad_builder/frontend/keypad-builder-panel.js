@@ -60,6 +60,24 @@ const keepAlias = (alias) => (alias && !OLD_ALIAS.test(alias) ? alias : null);
 
 const ledId = (deviceId, subtype) => `${ID_PREFIX}_${deviceId}_${slug(subtype)}_led`;
 const isOurs = (id) => String(id || "").startsWith(`${ID_PREFIX}_`);
+const SHARED_PREFIX = `${ID_PREFIX}_shared_`;
+const memberKey = (deviceId, subtype) => `${deviceId}|${subtype}`;
+
+// The keypad buttons a shared action listens to (its device triggers).
+function sharedMembers(config) {
+  return [].concat(config?.triggers ?? config?.trigger ?? [])
+    .filter((t) => (t.trigger || t.platform) === "device" && t.device_id && t.subtype != null)
+    .map((t) => ({ deviceId: t.device_id, subtype: String(t.subtype), type: t.type }));
+}
+
+const SORT_KEY = "keypad-builder-sort";
+function loadSort() {
+  try {
+    return localStorage.getItem(SORT_KEY) === "setup" ? "setup" : "room";
+  } catch (e) {
+    return "room";
+  }
+}
 
 const presetFor = (service) => PRESETS.find((p) => p.service === service);
 
@@ -292,6 +310,11 @@ class KeypadBuilderPanel extends HTMLElement {
     this._triggerCache = new Map();
     this._themeMode = loadThemeMode();
     this._s = {
+      view: "keypad",
+      ours: [],
+      shared: {},
+      sharedDraft: null,
+      sort: loadSort(),
       ledConfigs: {},
       led: null,
       ledDirty: false,
@@ -409,13 +432,27 @@ class KeypadBuilderPanel extends HTMLElement {
     s.loading = true;
     this._render();
     try {
-      const [devices, areas, entries, layouts, entities] = await Promise.all([
+      const [devices, areas, entries, layouts, entities, ours] = await Promise.all([
         this._hass.callWS({ type: "config/device_registry/list" }),
         this._hass.callWS({ type: "config/area_registry/list" }),
         this._hass.callWS({ type: "config_entries/get", domain: DEFAULT_DOMAIN }).catch(() => []),
         this._hass.callWS({ type: "keypad_builder/layouts/get" }).catch(() => ({})),
         this._hass.callWS({ type: "config/entity_registry/list" }).catch(() => []),
+        this._hass.callWS({ type: "keypad_builder/automations" }).catch(() => []),
       ]);
+      s.ours = ours || [];
+      s.shared = {};
+      await Promise.all(
+        s.ours
+          .filter((a) => a.shared)
+          .map(async (a) => {
+            try {
+              s.shared[a.id] = await this._hass.callApi("GET", `config/automation/config/${a.id}`);
+            } catch (e) {
+              // removed outside the builder
+            }
+          })
+      );
       s.layouts = layouts || {};
       const areaName = Object.fromEntries(areas.map((a) => [a.area_id, a.name]));
       // entity -> room, for the entity picker (entity's own room, else its device's room)
@@ -467,6 +504,8 @@ class KeypadBuilderPanel extends HTMLElement {
     if (!this._okToLeave()) return;
     if (s.editingLayout && !confirm("You're still editing this keypad's layout. Leave without saving it?")) return;
     Object.assign(s, {
+      view: "keypad",
+      sharedDraft: null,
       deviceId,
       loadingDevice: true,
       buttons: [],
@@ -555,7 +594,255 @@ class KeypadBuilderPanel extends HTMLElement {
   }
 
   _okToLeave() {
-    return (!this._s.dirty && !this._s.ledDirty) || confirm("You have unsaved changes for this button. Leave without saving?");
+    return (!this._s.dirty && !this._s.ledDirty) || confirm("You have unsaved changes. Leave without saving?");
+  }
+
+  // Keep our list of Keypad Builder automations current (drives the "set up" counts).
+  _trackOurs(id, deviceId, present) {
+    const s = this._s;
+    s.ours = s.ours.filter((a) => a.id !== id);
+    if (present) s.ours.push({ id, device_id: deviceId, shared: id.startsWith(SHARED_PREFIX) });
+  }
+
+  _setupCounts() {
+    const counts = {};
+    for (const a of this._s.ours) if (a.device_id) counts[a.device_id] = (counts[a.device_id] || 0) + 1;
+    for (const config of Object.values(this._s.shared)) {
+      for (const id of new Set(sharedMembers(config).map((m) => m.deviceId))) counts[id] = (counts[id] || 0) + 1;
+    }
+    return counts;
+  }
+
+  _sharedFor(deviceId, subtype) {
+    return Object.entries(this._s.shared)
+      .filter(([, config]) => sharedMembers(config).some((m) => m.deviceId === deviceId && m.subtype === subtype))
+      .map(([id, config]) => ({ id, config }));
+  }
+
+  _sharedSummary(config) {
+    const members = sharedMembers(config);
+    const what = members[0] ? typeLabel(members[0].type).replace(/^When /, "") : "";
+    return [`${members.length} button${members.length === 1 ? "" : "s"}`, what].filter(Boolean).join(" · ");
+  }
+
+  _memberLabel(m) {
+    const device = this._s.devices.find((d) => d.id === m.deviceId);
+    return {
+      button: this._s.layouts[m.deviceId]?.labels?.[m.subtype] || pretty(m.subtype),
+      where: device
+        ? [device.area, device.title + (device.showPosition ? ` (Pos ${device.position})` : "")].filter(Boolean).join(" · ")
+        : "Unknown keypad",
+    };
+  }
+
+  // ---------- shared actions ----------
+
+  _showShared() {
+    if (!this._okToLeave()) return;
+    Object.assign(this._s, { view: "shared", sharedDraft: null, rows: [], dirty: false, ledDirty: false, msg: null });
+    this._render();
+  }
+
+  _openShared(id) {
+    const s = this._s;
+    if (!this._okToLeave()) return;
+    const config = s.shared[id];
+    if (!config) return;
+    const members = sharedMembers(config);
+    const isMember = (t) => (t.trigger || t.platform) === "device" && t.device_id && t.subtype != null;
+    s.view = "shared";
+    s.sharedDraft = {
+      id,
+      name: config.alias || "",
+      type: members[0]?.type || "press",
+      members: members.map(({ deviceId, subtype }) => ({ deviceId, subtype })),
+      saved: new Set(members.map((m) => memberKey(m.deviceId, m.subtype))),
+      // keep any non-keypad triggers someone added in HA's editor
+      extra: [].concat(config.triggers ?? config.trigger ?? []).filter((t) => !isMember(t)),
+    };
+    s.rows = [].concat(config.actions ?? config.action ?? []).flatMap(parseAction);
+    Object.assign(s, { dirty: false, ledDirty: false, msg: null });
+    this._render();
+  }
+
+  // From the shared list ("new") or from a button ("copy this button's actions over").
+  _newShared(fromButton) {
+    const s = this._s;
+    const draft = { id: null, name: "", type: "press", members: [], saved: new Set(), extra: [] };
+    if (fromButton) {
+      if (s.ledDirty && !confirm("You have unsaved LED changes. Leave without saving?")) return;
+      const cur = this._current();
+      if (!cur) return;
+      draft.type = s.type;
+      draft.members = [{ deviceId: s.deviceId, subtype: cur.button.key }];
+      s.rows = JSON.parse(JSON.stringify(s.rows));
+    } else {
+      if (!this._okToLeave()) return;
+      s.rows = [];
+    }
+    Object.assign(s, { view: "shared", sharedDraft: draft, dirty: fromButton, ledDirty: false, msg: null });
+    this._render();
+  }
+
+  _sharedTypes(draft) {
+    const types = new Set();
+    for (const m of draft.members) {
+      for (const t of this._triggerCache.get(m.deviceId) || []) if (String(t.subtype) === m.subtype) types.add(t.type);
+    }
+    if (!types.size) ["press", "release"].forEach((t) => types.add(t));
+    types.add(draft.type);
+    const order = ["press", "release", "multi_tap"];
+    return [...types].sort((a, b) => (order.indexOf(a) + 1 || 99) - (order.indexOf(b) + 1 || 99));
+  }
+
+  async _saveShared() {
+    const s = this._s;
+    const d = s.sharedDraft;
+    const fail = (text) => {
+      s.msg = { type: "error", text };
+      this._render();
+    };
+    const name = d.name.trim();
+    if (!name) return fail("Give it a name first 💛 (like “Movie time”)");
+    if (!d.members.length) return fail("Add at least one button 💛");
+    let actions;
+    try {
+      actions = s.rows.map(buildAction);
+    } catch (e) {
+      return fail(e.message);
+    }
+    if (!actions.length) return d.id ? this._deleteShared() : fail("Add at least one action first 💛");
+
+    const what = typeLabel(d.type).replace(/^When /, "");
+    await Promise.all(d.members.map((m) => this._triggers(m.deviceId).catch(() => [])));
+    const triggers = [];
+    const missing = [];
+    for (const m of d.members) {
+      const t = this._triggerCache.get(m.deviceId)?.find((x) => String(x.subtype) === m.subtype && x.type === d.type);
+      if (!t) missing.push(m);
+      else {
+        const { metadata, ...clean } = t;
+        triggers.push(clean);
+      }
+    }
+    if (missing.length) {
+      const names = missing.map((m) => this._memberLabel(m).button).join(", ");
+      return fail(`${names} can't do “${what}”. Remove ${missing.length === 1 ? "it" : "them"} or pick a different “Runs when”.`);
+    }
+
+    s.busy = true;
+    this._render();
+    try {
+      // Newly added buttons that already do something on their own would run twice.
+      const conflicts = [];
+      await Promise.all(
+        d.members
+          .filter((m) => !d.saved.has(memberKey(m.deviceId, m.subtype)))
+          .map(async (m) => {
+            const id = autoId(m.deviceId, m.subtype, d.type);
+            try {
+              await this._hass.callApi("GET", `config/automation/config/${id}`);
+              conflicts.push({ m, id });
+            } catch (e) {
+              // no own automation, nothing to clash with
+            }
+          })
+      );
+      if (
+        conflicts.length &&
+        confirm(
+          `${conflicts.length === 1 ? "1 of these buttons already has" : `${conflicts.length} of these buttons already have`} their own “${what}” actions:\n\n` +
+            conflicts.map((c) => `• ${this._memberLabel(c.m).button} (${this._memberLabel(c.m).where})`).join("\n") +
+            "\n\nRemove those so only this shared action runs?\n(Cancel keeps both, so both will run.)"
+        )
+      ) {
+        for (const c of conflicts) {
+          await this._hass.callApi("DELETE", `config/automation/config/${c.id}`);
+          this._trackOurs(c.id, c.m.deviceId, false);
+          delete s.configs[c.id];
+        }
+      }
+
+      const id = d.id || `${SHARED_PREFIX}${slug(name) || "action"}_${Math.random().toString(36).slice(2, 6)}`;
+      const existing = s.shared[id] || {};
+      const config = {
+        ...existing,
+        alias: name,
+        description: existing.description ?? "Shared action made with Keypad Builder 🎛️",
+        mode: existing.mode || "single",
+        triggers: [...triggers, ...d.extra],
+        conditions: existing.conditions ?? existing.condition ?? [],
+        actions,
+      };
+      for (const k of ["id", "trigger", "condition", "action"]) delete config[k];
+      await this._hass.callApi("POST", `config/automation/config/${id}`, config);
+      s.shared[id] = { ...config, id };
+      this._trackOurs(id, null, true);
+      d.id = id;
+      d.saved = new Set(d.members.map((m) => memberKey(m.deviceId, m.subtype)));
+      s.dirty = false;
+      s.msg = { type: "ok", text: `Saved! ${d.members.length === 1 ? "That button does" : `All ${d.members.length} buttons do`} this now ✨` };
+    } catch (e) {
+      s.msg = { type: "error", text: `Save failed: ${e.body?.message || e.message || e}` };
+    }
+    s.busy = false;
+    this._render();
+  }
+
+  async _deleteShared() {
+    const s = this._s;
+    const d = s.sharedDraft;
+    if (!d?.id || !confirm(`Delete “${d.name || "this shared action"}”? Its buttons will stop doing this.`)) return;
+    try {
+      await this._hass.callApi("DELETE", `config/automation/config/${d.id}`);
+      delete s.shared[d.id];
+      this._trackOurs(d.id, null, false);
+      Object.assign(s, { sharedDraft: null, rows: [], dirty: false, msg: { type: "ok", text: "Deleted 🫧" } });
+    } catch (e) {
+      s.msg = { type: "error", text: `Delete failed: ${e.body?.message || e.message || e}` };
+    }
+    this._render();
+  }
+
+  // ---------- button picker (for shared actions) ----------
+
+  async _openButtonPicker() {
+    const s = this._s;
+    this._bp = {
+      q: "",
+      loading: true,
+      selected: new Set(s.sharedDraft.members.map((m) => memberKey(m.deviceId, m.subtype))),
+    };
+    this._render();
+    this.shadowRoot.querySelector("#bp-q")?.focus();
+    await Promise.all(s.devices.map((d) => this._triggers(d.id).catch(() => [])));
+    if (!this._bp) return;
+    this._bp.loading = false;
+    this._renderButtonPickerList();
+  }
+
+  _closeButtonPicker(apply) {
+    const s = this._s;
+    if (apply) {
+      const d = s.sharedDraft;
+      const kept = d.members.filter((m) => this._bp.selected.has(memberKey(m.deviceId, m.subtype)));
+      const keptKeys = new Set(kept.map((m) => memberKey(m.deviceId, m.subtype)));
+      const added = [...this._bp.selected]
+        .filter((k) => !keptKeys.has(k))
+        .map((k) => ({ deviceId: k.slice(0, k.indexOf("|")), subtype: k.slice(k.indexOf("|") + 1) }));
+      d.members = [...kept, ...added];
+      s.dirty = true;
+      s.msg = null;
+    }
+    this._bp = null;
+    this._render();
+  }
+
+  _buttonsOf(deviceId) {
+    const subtypes = [...new Set((this._triggerCache.get(deviceId) || []).map((t) => String(t.subtype)))];
+    const order = (this._s.layouts[deviceId]?.rows || []).flat();
+    const rank = (k) => (order.includes(k) ? order.indexOf(k) : 1000 + subtypes.indexOf(k));
+    return subtypes.sort((a, b) => rank(a) - rank(b));
   }
 
   // Organize every Keypad Builder automation (backend sets area/category/label),
@@ -649,6 +936,7 @@ class KeypadBuilderPanel extends HTMLElement {
     try {
       await this._hass.callApi("POST", `config/automation/config/${id}`, config);
       s.ledConfigs[id] = { ...config, id };
+      this._trackOurs(id, s.deviceId, true);
       s.ledDirty = false;
       s.ledMsg = { type: "ok", text: "LED saved! 💡" };
       // sync the LED right away instead of waiting for the next change
@@ -668,6 +956,7 @@ class KeypadBuilderPanel extends HTMLElement {
     try {
       await this._hass.callApi("DELETE", `config/automation/config/${id}`);
       delete s.ledConfigs[id];
+      this._trackOurs(id, s.deviceId, false);
       s.led = parseLed(null);
       s.ledDirty = false;
       s.ledMsg = { type: "ok", text: "Done, Lutron controls this LED again." };
@@ -760,6 +1049,7 @@ class KeypadBuilderPanel extends HTMLElement {
     try {
       await this._hass.callApi("POST", `config/automation/config/${cur.id}`, config);
       s.configs[cur.id] = { ...config, id: cur.id };
+      this._trackOurs(cur.id, s.deviceId, true);
       s.dirty = false;
       s.msg = { type: "ok", text: "Saved! Go press that button ✨" };
     } catch (e) {
@@ -779,6 +1069,7 @@ class KeypadBuilderPanel extends HTMLElement {
     try {
       await this._hass.callApi("DELETE", `config/automation/config/${cur.id}`);
       delete s.configs[cur.id];
+      this._trackOurs(cur.id, s.deviceId, false);
       s.rows = [];
       s.dirty = false;
       s.msg = { type: "ok", text: "Removed. This button does nothing now 🫧" };
@@ -834,6 +1125,35 @@ class KeypadBuilderPanel extends HTMLElement {
           return this._delete();
         case "tidy":
           return this._tidyUp();
+        case "shared-view":
+          return this._showShared();
+        case "shared-new":
+          return this._newShared(false);
+        case "shared-from-button":
+          return this._newShared(true);
+        case "shared-open":
+          return this._openShared(el.dataset.id);
+        case "s-save":
+          return this._saveShared();
+        case "s-delete":
+          return this._deleteShared();
+        case "s-remove-member":
+          s.sharedDraft.members = s.sharedDraft.members.filter((m) => memberKey(m.deviceId, m.subtype) !== el.dataset.key);
+          s.dirty = true;
+          s.msg = null;
+          return this._render();
+        case "bp-open":
+          return this._openButtonPicker();
+        case "bp-close":
+          return this._closeButtonPicker(false);
+        case "bp-done":
+          return this._closeButtonPicker(true);
+        case "bp-toggle": {
+          const sel = this._bp.selected;
+          if (sel.has(el.dataset.key)) sel.delete(el.dataset.key);
+          else sel.add(el.dataset.key);
+          return this._renderButtonPickerList();
+        }
         case "reload":
           this._triggerCache.clear();
           return this._loadDevices();
@@ -880,7 +1200,9 @@ class KeypadBuilderPanel extends HTMLElement {
     });
 
     root.addEventListener("keydown", (ev) => {
-      if (ev.key === "Escape" && this._picker) this._closePicker();
+      if (ev.key !== "Escape") return;
+      if (this._picker) this._closePicker();
+      else if (this._bp) this._closeButtonPicker(false);
     });
 
     root.addEventListener("input", (ev) => {
@@ -889,6 +1211,15 @@ class KeypadBuilderPanel extends HTMLElement {
       if (el.id === "search") {
         s.filter = el.value;
         return this._renderDeviceList();
+      }
+      if (el.id === "bp-q") {
+        this._bp.q = el.value;
+        return this._renderButtonPickerList();
+      }
+      if (el.dataset.sfield === "name") {
+        s.sharedDraft.name = el.value;
+        s.dirty = true;
+        return;
       }
       if (el.id === "pick-q") {
         this._picker.q = el.value;
@@ -923,6 +1254,21 @@ class KeypadBuilderPanel extends HTMLElement {
     root.addEventListener("change", (ev) => {
       const el = ev.target;
       const s = this._s;
+      if (el.dataset.sfield === "type") {
+        s.sharedDraft.type = el.value;
+        s.dirty = true;
+        s.msg = null;
+        return this._render();
+      }
+      if (el.id === "sort") {
+        s.sort = el.value;
+        try {
+          localStorage.setItem(SORT_KEY, s.sort);
+        } catch (e) {
+          // just won't be remembered
+        }
+        return this._renderDeviceList();
+      }
       if (el.id === "pick-area" || el.id === "pick-type") {
         this._picker[el.id === "pick-area" ? "area" : "type"] = el.value;
         return this._renderPickerList();
@@ -950,7 +1296,7 @@ class KeypadBuilderPanel extends HTMLElement {
         const old = s.rows[i];
         const row = newRow(el.value);
         // keep the chosen entity when switching between similar actions
-        if (presetFor(el.value)?.led) row.entity = this._current()?.button.ledEntity || "";
+        if (presetFor(el.value)?.led) row.entity = (s.view === "keypad" && this._current()?.button.ledEntity) || "";
         else if ("entity" in row && old.entity) row.entity = old.entity;
         s.rows[i] = row;
         s.dirty = true;
@@ -984,23 +1330,35 @@ class KeypadBuilderPanel extends HTMLElement {
           </div>
           <input id="search" type="search" placeholder="Search keypads…" value="${esc(s.filter)}">
           <label class="check"><input id="all-devices" type="checkbox" ${s.allDevices ? "checked" : ""}> Show devices from all integrations</label>
+          <div class="inline sort"><label for="sort">Sort</label>
+            <select id="sort">
+              <option value="room" ${s.sort === "room" ? "selected" : ""}>By room</option>
+              <option value="setup" ${s.sort === "setup" ? "selected" : ""}>Set up first</option>
+            </select>
+          </div>
+          <button class="dev shared-entry ${s.view === "shared" ? "active" : ""}" data-act="shared-view">
+            <span class="dev-title">🔗 Shared actions${Object.keys(s.shared).length ? ` <span class="chip">${Object.keys(s.shared).length}</span>` : ""}</span>
+            <small>One action for buttons on many keypads</small>
+          </button>
           ${s.tidyMsg ? `<div class="msg ${s.tidyMsg.type}">${esc(s.tidyMsg.text)}</div>` : ""}
           <div id="devlist"></div>
         </section>
 
         <section class="card keypad-wrap">
-          ${this._renderKeypad(device)}
+          ${s.view === "shared" ? this._renderSharedList() : this._renderKeypad(device)}
         </section>
 
         <section class="card editor">
-          ${this._renderEditor()}
+          ${s.view === "shared" ? this._renderSharedEditor() : this._renderEditor()}
         </section>
       </div>
       ${this._renderDatalists()}
       ${this._renderPicker()}
+      ${this._renderButtonPicker()}
     `;
     this._renderDeviceList();
     this._renderPickerList();
+    this._renderButtonPickerList();
     this._syncMenu();
     this._updateLeds();
   }
@@ -1021,17 +1379,33 @@ class KeypadBuilderPanel extends HTMLElement {
         : `<p class="muted">No Lutron keypads found 🥲<br>Make sure the <b>Lutron Caséta</b> integration (it handles RA3 too) is set up, or tick “all integrations” above.</p>`;
       return;
     }
-    let lastArea = null;
-    box.innerHTML = list
-      .map((d) => {
-        const header = d.area !== lastArea ? `<div class="area">${esc(d.area || "No area")}</div>` : "";
-        lastArea = d.area;
-        return `${header}<button class="dev ${d.id === s.deviceId ? "active" : ""}" data-act="device" data-id="${esc(d.id)}">
-          <span class="dev-title" title="${esc(d.name)}">${esc(d.title)}${d.showPosition ? ` <span class="chip">Pos ${d.position}</span>` : ""}</span>
-          ${d.type || d.code ? `<small>${esc(d.type || d.code)}</small>` : ""}
-        </button>`;
-      })
-      .join("");
+    const counts = this._setupCounts();
+    const row = (d, sub) => `<button class="dev ${d.id === s.deviceId && s.view === "keypad" ? "active" : ""}" data-act="device" data-id="${esc(d.id)}">
+        <span class="dev-title" title="${esc(d.name)}">${esc(d.title)}${d.showPosition ? ` <span class="chip">Pos ${d.position}</span>` : ""}${
+          counts[d.id] ? ` <span class="chip on">${counts[d.id]} set up</span>` : ""
+        }</span>
+        ${sub ? `<small>${esc(sub)}</small>` : ""}
+      </button>`;
+
+    let lastGroup = null;
+    const header = (group) => {
+      if (group === lastGroup) return "";
+      lastGroup = group;
+      return `<div class="area">${esc(group)}</div>`;
+    };
+    if (s.sort === "setup") {
+      box.innerHTML = [...list]
+        .sort(
+          (a, b) =>
+            (counts[b.id] || 0) - (counts[a.id] || 0) ||
+            (a.area || "~").localeCompare(b.area || "~") ||
+            a.title.localeCompare(b.title)
+        )
+        .map((d) => header(counts[d.id] ? "Set up" : "Not set up yet") + row(d, [d.area, d.type || d.code].filter(Boolean).join(" · ")))
+        .join("");
+    } else {
+      box.innerHTML = list.map((d) => header(d.area || "No area") + row(d, d.type || d.code)).join("");
+    }
   }
 
   _renderKeypad(device) {
@@ -1046,10 +1420,11 @@ class KeypadBuilderPanel extends HTMLElement {
 
     const btn = (b, small) => {
       const has = Object.keys(b.triggers).some((t) => s.configs[autoId(s.deviceId, b.subtype, t)]);
-      const other = !has && this._relatedFor(b).length > 0;
+      const inShared = !has && this._sharedFor(s.deviceId, b.key).length > 0;
+      const other = !has && !inShared && this._relatedFor(b).length > 0;
       const hidden = layout.hidden.includes(b.key);
       const label = this._layoutLabel(b.key, layout);
-      const cls = ["kbtn", small && "small", b.key === s.sel && !editing && "active", has && "has", other && "has-other", hidden && "is-hidden", b.led && "with-led"];
+      const cls = ["kbtn", small && "small", b.key === s.sel && !editing && "active", has && "has", inShared && "has-shared", other && "has-other", hidden && "is-hidden", b.led && "with-led"];
       return `<button class="${cls.filter(Boolean).join(" ")}" data-act="button" data-key="${esc(b.key)}" title="${esc(label)}">
         ${b.led ? `<span class="led" ${b.ledEntity ? `data-led-entity="${esc(b.ledEntity)}"` : ""}></span>` : ""}<span class="label">${esc(label)}</span><span class="dot"></span>
       </button>`;
@@ -1079,8 +1454,10 @@ class KeypadBuilderPanel extends HTMLElement {
         editing
           ? this._renderLayoutEditor(layout, byKey)
           : `<div class="muted center legend"><span><span class="dot on"></span> set up here</span>${
-              s.related.length ? `<span><span class="dot other"></span> used by another automation</span>` : ""
-            }</div>`
+              s.buttons.some((b) => this._sharedFor(s.deviceId, b.key).length)
+                ? `<span><span class="dot shared"></span> in a shared action</span>`
+                : ""
+            }${s.related.length ? `<span><span class="dot other"></span> used by another automation</span>` : ""}</div>`
       }
     `;
   }
@@ -1171,9 +1548,172 @@ class KeypadBuilderPanel extends HTMLElement {
               <div class="muted">Changes you make there show up here too.</div></div>`
           : ""
       }
+      ${this._renderSharedSection(cur.button)}
       ${this._renderLedSection(cur.button)}
       ${this._renderRelated(cur.button)}
     `;
+  }
+
+  _renderSharedSection(button) {
+    const list = this._sharedFor(this._s.deviceId, button.key);
+    return `
+      <div class="section">
+        <h3>🔗 Shared actions</h3>
+        ${
+          list.length
+            ? list
+                .map(
+                  ({ id, config }) => `<div class="related">
+                    <div><div>${esc(config.alias || "Shared action")}</div><div class="muted">${esc(this._sharedSummary(config))}</div></div>
+                    <button class="link" data-act="shared-open" data-id="${esc(id)}">Open</button>
+                  </div>`
+                )
+                .join("")
+            : `<div class="muted">Want buttons on other keypads to do the same thing as this one?</div>`
+        }
+        <div><button class="ghost" data-act="shared-from-button">🔗 Share this button's actions…</button></div>
+      </div>`;
+  }
+
+  _renderSharedList() {
+    const s = this._s;
+    const items = Object.entries(s.shared).sort((a, b) => (a[1].alias || "").localeCompare(b[1].alias || ""));
+    return `
+      <div class="device-name">🔗 Shared actions</div>
+      <p class="muted">One set of actions for buttons on lots of keypads. Change it once and every button updates.</p>
+      <div class="shared-list">
+        ${
+          items.length
+            ? items
+                .map(
+                  ([id, config]) => `<button class="dev ${s.sharedDraft?.id === id ? "active" : ""}" data-act="shared-open" data-id="${esc(id)}">
+                    <span class="dev-title">${esc(config.alias || "Shared action")}</span>
+                    <small>${esc(this._sharedSummary(config))}</small>
+                  </button>`
+                )
+                .join("")
+            : `<p class="muted center">None yet ✨</p>`
+        }
+      </div>
+      <button class="add" data-act="shared-new">＋ New shared action</button>`;
+  }
+
+  _renderSharedEditor() {
+    const s = this._s;
+    const d = s.sharedDraft;
+    if (!d) {
+      return `<div class="empty">Pick a shared action, or make a new one ✨</div>
+        ${s.msg ? `<div class="msg ${s.msg.type}">${esc(s.msg.text)}</div>` : ""}`;
+    }
+    const what = typeLabel(d.type).replace(/^When /, "");
+    const typeOptions = this._sharedTypes(d)
+      .map((t) => `<option value="${esc(t)}" ${t === d.type ? "selected" : ""}>${esc(typeLabel(t))}</option>`)
+      .join("");
+    const members = d.members
+      .map((m) => {
+        const { button, where } = this._memberLabel(m);
+        const cached = this._triggerCache.get(m.deviceId);
+        const ok = !cached || cached.some((t) => String(t.subtype) === m.subtype && t.type === d.type);
+        return `<div class="member">
+          <span class="ef-text"><span class="ef-name">${esc(button)}</span><span class="ef-meta">${esc(where)}</span></span>
+          ${ok ? "" : `<span class="warn">can't do “${esc(what)}”</span>`}
+          <button class="icon" data-act="s-remove-member" data-key="${esc(memberKey(m.deviceId, m.subtype))}" title="Remove this button">✕</button>
+        </div>`;
+      })
+      .join("");
+
+    return `
+      <h2>${d.id ? esc(d.name || "Shared action") : "New shared action"}</h2>
+      <div class="inline"><label>Name</label><input class="grow" data-sfield="name" value="${esc(d.name)}" placeholder="e.g. Movie time"></div>
+      <div class="inline"><label>Runs when</label><select data-sfield="type">${typeOptions}</select></div>
+
+      <div class="section">
+        <h3>Buttons <span class="muted">${d.members.length}</span></h3>
+        <div class="members">${members || `<div class="muted empty-rows">No buttons yet. Add some from any keypad 👇</div>`}</div>
+        <button class="add" data-act="bp-open">＋ Add buttons from any keypad</button>
+      </div>
+
+      <div class="section">
+        <h3>Actions</h3>
+        <p class="muted">Actions run top to bottom.</p>
+        <div class="rows">
+          ${s.rows.length ? s.rows.map((r, i) => this._renderRow(r, i)).join("") : `<div class="muted empty-rows">No actions yet, add one below 👇</div>`}
+        </div>
+        <button class="add" data-act="add">＋ Add action</button>
+      </div>
+      ${s.msg ? `<div class="msg ${s.msg.type}">${esc(s.msg.text)}</div>` : ""}
+      <div class="footer">
+        ${d.id ? `<button class="danger" data-act="s-delete" ${s.busy ? "disabled" : ""}>Delete</button>` : ""}
+        <span class="spacer"></span>
+        ${s.dirty ? `<span class="muted">unsaved changes</span>` : ""}
+        <button class="primary" data-act="s-save" ${s.busy ? "disabled" : ""}>${s.busy ? "Saving…" : "Save"}</button>
+      </div>
+      ${
+        d.id
+          ? `<div class="advanced">Want conditions or other fancy stuff?
+              <button class="link" data-act="open-editor" data-id="${esc(d.id)}">Open in HA automation editor ↗</button></div>`
+          : ""
+      }`;
+  }
+
+  _renderButtonPicker() {
+    if (!this._bp) return "";
+    return `
+      <div class="picker-backdrop" data-act="bp-close"></div>
+      <div class="picker" role="dialog" aria-label="Choose buttons">
+        <div class="picker-head">
+          <h3>Choose buttons</h3>
+          <button class="icon" data-act="bp-close" title="Close">✕</button>
+        </div>
+        <input id="bp-q" type="search" placeholder="Search keypads or rooms…" value="${esc(this._bp.q)}" autocomplete="off">
+        <div id="bp-list" class="pick-list"></div>
+        <div class="picker-foot">
+          <span class="muted" id="bp-count"></span>
+          <span class="spacer"></span>
+          <button class="ghost" data-act="bp-close">Cancel</button>
+          <button class="primary" data-act="bp-done">Done</button>
+        </div>
+      </div>`;
+  }
+
+  _renderButtonPickerList() {
+    const bp = this._bp;
+    const box = this.shadowRoot.querySelector("#bp-list");
+    if (!bp || !box) return;
+    const count = this.shadowRoot.querySelector("#bp-count");
+    if (count) count.textContent = `${bp.selected.size} selected`;
+    if (bp.loading) {
+      box.innerHTML = `<p class="muted center">Loading buttons…</p>`;
+      return;
+    }
+    const words = bp.q.toLowerCase().split(/\s+/).filter(Boolean);
+    const devices = this._s.devices.filter((d) => {
+      const hay = `${d.title} ${d.name} ${d.area} ${d.type}`.toLowerCase();
+      return words.every((w) => hay.includes(w)) && this._buttonsOf(d.id).length;
+    });
+    if (!devices.length) {
+      box.innerHTML = `<p class="muted center">No keypads match 🥲</p>`;
+      return;
+    }
+    let lastArea = null;
+    box.innerHTML = devices
+      .map((d) => {
+        const header = d.area !== lastArea ? `<div class="area">${esc(d.area || "No area")}</div>` : "";
+        lastArea = d.area;
+        const buttons = this._buttonsOf(d.id)
+          .map((subtype) => {
+            const key = memberKey(d.id, subtype);
+            const on = bp.selected.has(key);
+            const label = this._s.layouts[d.id]?.labels?.[subtype] || pretty(subtype);
+            return `<button class="bp-btn ${on ? "on" : ""}" data-act="bp-toggle" data-key="${esc(key)}" aria-pressed="${on}">${on ? "✓ " : ""}${esc(label)}</button>`;
+          })
+          .join("");
+        return `${header}<div class="bp-keypad">
+          <div class="bp-title">${esc(d.title)}${d.showPosition ? ` <span class="chip">Pos ${d.position}</span>` : ""} <small class="muted">${esc(d.type || d.code || "")}</small></div>
+          <div class="bp-buttons">${buttons}</div>
+        </div>`;
+      })
+      .join("");
   }
 
   _renderLedSection(button) {
@@ -1490,6 +2030,7 @@ const STYLES = `
     --kb-on: var(--success-color, #43a047);
     --kb-error: var(--error-color, #db4437);
     --kb-other: var(--info-color, #039be5);
+    --kb-shared: #9b6dff;
     --kb-radius: 14px;
 
     display: block;
@@ -1592,7 +2133,24 @@ const STYLES = `
   .pick-item.active { border-color: var(--kb-accent); background: color-mix(in srgb, var(--kb-accent) 12%, transparent); }
   .pi-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
   .pi-state { font-size: 12px; color: var(--kb-muted); flex: none; }
-  .picker-foot { display: flex; justify-content: flex-end; }
+  .picker-foot { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+  .chip.on { background: color-mix(in srgb, var(--kb-on) 22%, transparent); }
+  .sort { margin-bottom: 8px; }
+  .sort label { min-width: 0; }
+  .shared-entry { margin: 4px 0 4px; border-color: var(--kb-border); }
+  .shared-list { display: flex; flex-direction: column; gap: 2px; margin: 8px 0 12px; }
+  .members { display: flex; flex-direction: column; gap: 6px; }
+  .member { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border: 1px solid var(--kb-border); border-radius: 10px; }
+  .warn { font-size: 12px; color: var(--kb-error); white-space: nowrap; }
+  .bp-keypad { padding: 6px 4px 10px; }
+  .bp-title { font-weight: 500; margin-bottom: 6px; }
+  .bp-buttons { display: flex; flex-wrap: wrap; gap: 6px; }
+  .bp-btn {
+    border: 1px solid var(--kb-border); background: var(--kb-input); border-radius: 999px;
+    padding: 5px 12px; font-size: 13px;
+  }
+  .bp-btn:hover { border-color: var(--kb-accent); }
+  .bp-btn.on { background: var(--kb-accent); border-color: var(--kb-accent); color: var(--kb-on-accent); }
   .source { margin-top: 10px; font-size: 12px; color: var(--kb-muted); }
 
   /* ---- faceplate ---- */
@@ -1635,12 +2193,14 @@ const STYLES = `
     background: #ffd76a; box-shadow: 0 0 6px 2px rgba(255, 200, 80, .75);
   }
   .kbtn.has-other .dot { background: var(--kb-other); }
+  .kbtn.has-shared .dot { background: var(--kb-shared); }
   .pair { display: flex; gap: 8px; }
   .kbtn.small { min-height: 34px; padding: 4px 16px; font-size: 11px; }
   .kbtn.small.with-led { padding-left: 18px; padding-right: 14px; letter-spacing: .04em; }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: transparent; vertical-align: middle; }
   .dot.on { background: var(--kb-on); }
   .dot.other { background: var(--kb-other); }
+  .dot.shared { background: var(--kb-shared); }
   .legend { margin-top: 4px; display: flex; flex-wrap: wrap; justify-content: center; gap: 4px 14px; }
 
   /* ---- extra editor sections ---- */
