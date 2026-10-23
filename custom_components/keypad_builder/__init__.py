@@ -32,6 +32,7 @@ from .const import (
     STATIC_URL,
     VERSION,
 )
+from .organize import async_organize_all, async_track_organizing
 from .websocket import async_setup_websocket
 
 CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
@@ -71,6 +72,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         require_admin=True,
         config={},
     )
+
+    # Tidy automations made before this version, then keep new ones tidy.
+    async_organize_all(hass)
+    for unsub in async_track_organizing(hass):
+        entry.async_on_unload(unsub)
     return True
 
 

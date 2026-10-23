@@ -26,6 +26,7 @@ from homeassistant.helpers.importlib import async_import_module
 from homeassistant.helpers.storage import Store
 
 from .const import DOMAIN, STORAGE_KEY, STORAGE_VERSION
+from .organize import async_organize_all
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -53,6 +54,7 @@ async def async_setup_websocket(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_save_layout)
     websocket_api.async_register_command(hass, ws_lutron_info)
     websocket_api.async_register_command(hass, ws_button_automations)
+    websocket_api.async_register_command(hass, ws_organize)
 
 
 @websocket_api.websocket_command({vol.Required("type"): "keypad_builder/layouts/get"})
@@ -110,6 +112,16 @@ async def ws_button_automations(
 ) -> None:
     """List every automation that uses one of this device's buttons as a trigger."""
     connection.send_result(msg["id"], await _async_button_automations(hass, msg["device_id"]))
+
+
+@websocket_api.websocket_command({vol.Required("type"): "keypad_builder/organize"})
+@websocket_api.require_admin
+@callback
+def ws_organize(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
+) -> None:
+    """Tidy every Keypad Builder automation now and list them (the panel renames old ones)."""
+    connection.send_result(msg["id"], async_organize_all(hass))
 
 
 async def _async_button_automations(hass: HomeAssistant, device_id: str) -> list[dict[str, Any]]:
