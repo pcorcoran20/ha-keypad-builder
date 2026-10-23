@@ -1,3 +1,5 @@
+<p align="center"><img src="brand/icon.png" alt="Keypad Builder icon" width="128"></p>
+
 # 🎛️ Keypad Builder
 
 A visual editor for keypad button automations in Home Assistant. Made for **Lutron RA3** (and Caséta / Picos), but it can work with any device that has button triggers.
