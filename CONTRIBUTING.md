@@ -1,10 +1,11 @@
-# Keypad Builder
+# Contributing to Keypad Builder
 
-Personal Home Assistant hobby project by Patrick (pcorcoran20). No company attribution anywhere.
+Thanks for wanting to help! 🦆 This is a personal Home Assistant hobby project by Patrick (pcorcoran20).
+Please keep it free of company branding or attribution.
 
 ## File header (required)
 
-Every code file starts with this header. Use it for all existing files and for any new file you create.
+Every code file starts with this header, including any new file you add.
 
 ```
 # ─────────────────────────────────────────────
@@ -29,7 +30,7 @@ Rules:
   which XML comments don't allow. Put the header (with `#` lines, unchanged) in a
   `<metadata><![CDATA[ ... ]]></metadata>` block right after the opening `<svg>` tag instead.
 - The "Muscovy Public License" is a joke. The real license lives in `LICENSE` at the repo root, never in the header.
-  The project uses MIT (`LICENSE`, copyright "Patrick (pcorcoran20)"). Ask Patrick before changing it.
+  The project uses MIT (`LICENSE`, copyright "Patrick (pcorcoran20)"). Please open an issue before proposing a license change.
 
 ## Releases
 
