@@ -35,6 +35,63 @@ const autoId = (deviceId, subtype, type) => `${ID_PREFIX}_${deviceId}_${slug(sub
 
 const presetFor = (service) => PRESETS.find((p) => p.service === service);
 
+const FINISHES = [
+  ["auto", "Match light/dark mode"],
+  ["white", "White"],
+  ["ivory", "Ivory"],
+  ["gray", "Gray"],
+  ["black", "Black"],
+  ["brass", "Brass"],
+  ["nickel", "Nickel"],
+];
+
+const THEME_KEY = "keypad-builder-theme";
+const THEME_MODES = ["auto", "light", "dark"];
+const THEME_ICONS = { auto: "🌗", light: "☀️", dark: "🌙" };
+
+const isRaise = (label) => /^(raise|up)\b/i.test(label);
+const isLower = (label) => /^(lower|down)\b/i.test(label);
+
+// Default layout: one button per row, raise/lower side by side.
+function autoLayout(buttons, finish = "auto") {
+  const rows = [];
+  for (let i = 0; i < buttons.length; i++) {
+    const b = buttons[i];
+    const next = buttons[i + 1];
+    if (next && ((isLower(b.label) && isRaise(next.label)) || (isRaise(b.label) && isLower(next.label)))) {
+      rows.push(isLower(b.label) ? [b.key, next.key] : [next.key, b.key]);
+      i++;
+    } else {
+      rows.push([b.key]);
+    }
+  }
+  return { rows, labels: {}, hidden: [], finish };
+}
+
+// Make a saved layout fit the buttons the keypad has now.
+function reconcileLayout(saved, buttons) {
+  const keys = new Set(buttons.map((b) => b.key));
+  const seen = new Set();
+  const rows = (saved.rows || [])
+    .map((row) => row.filter((k) => keys.has(k) && !seen.has(k) && seen.add(k)))
+    .filter((row) => row.length);
+  for (const b of buttons) if (!seen.has(b.key)) rows.push([b.key]);
+  const labels = Object.fromEntries(Object.entries(saved.labels || {}).filter(([k, v]) => keys.has(k) && v));
+  const hidden = (saved.hidden || []).filter((k) => keys.has(k));
+  return { rows, labels, hidden, finish: saved.finish || "auto" };
+}
+
+const cloneLayout = (l) => JSON.parse(JSON.stringify(l));
+
+function loadThemeMode() {
+  try {
+    const mode = localStorage.getItem(THEME_KEY);
+    return THEME_MODES.includes(mode) ? mode : "auto";
+  } catch (e) {
+    return "auto";
+  }
+}
+
 function delaySeconds(delay) {
   if (typeof delay === "number") return delay;
   if (typeof delay === "string" && /^\d+(:\d+){0,2}$/.test(delay)) {
@@ -144,7 +201,13 @@ class KeypadBuilderPanel extends HTMLElement {
     super();
     this.attachShadow({ mode: "open" });
     this._triggerCache = new Map();
+    this._themeMode = loadThemeMode();
     this._s = {
+      layouts: {},
+      info: null,
+      layout: null,
+      layoutDraft: null,
+      editingLayout: false,
       loading: true,
       allDevices: false,
       devices: [],
@@ -165,6 +228,7 @@ class KeypadBuilderPanel extends HTMLElement {
   set hass(hass) {
     const first = !this._hass;
     this._hass = hass;
+    this._applyTheme();
     if (first) {
       this._attachListeners();
       this._render();
@@ -184,6 +248,28 @@ class KeypadBuilderPanel extends HTMLElement {
 
   set panel(panel) {
     this._panel = panel;
+  }
+
+  // Host attributes drive the CSS: mode = what the user picked, dark = what's showing.
+  _applyTheme() {
+    const dark = this._themeMode === "dark" || (this._themeMode === "auto" && !!this._hass?.themes?.darkMode);
+    this.setAttribute("mode", this._themeMode);
+    this.toggleAttribute("dark", dark);
+  }
+
+  _cycleTheme() {
+    this._themeMode = THEME_MODES[(THEME_MODES.indexOf(this._themeMode) + 1) % THEME_MODES.length];
+    try {
+      localStorage.setItem(THEME_KEY, this._themeMode);
+    } catch (e) {
+      // private window etc. – it just won't be remembered
+    }
+    this._applyTheme();
+    const btn = this.shadowRoot.querySelector("#theme");
+    if (btn) {
+      btn.textContent = THEME_ICONS[this._themeMode];
+      btn.title = `Theme: ${this._themeMode}`;
+    }
   }
 
   _syncMenu() {
@@ -209,11 +295,13 @@ class KeypadBuilderPanel extends HTMLElement {
     s.loading = true;
     this._render();
     try {
-      const [devices, areas, entries] = await Promise.all([
+      const [devices, areas, entries, layouts] = await Promise.all([
         this._hass.callWS({ type: "config/device_registry/list" }),
         this._hass.callWS({ type: "config/area_registry/list" }),
         this._hass.callWS({ type: "config_entries/get", domain: DEFAULT_DOMAIN }).catch(() => []),
+        this._hass.callWS({ type: "keypad_builder/layouts/get" }).catch(() => ({})),
       ]);
+      s.layouts = layouts || {};
       const areaName = Object.fromEntries(areas.map((a) => [a.area_id, a.name]));
       const entryIds = new Set(entries.map((e) => e.entry_id));
 
@@ -246,17 +334,42 @@ class KeypadBuilderPanel extends HTMLElement {
   async _selectDevice(deviceId) {
     const s = this._s;
     if (!this._okToLeave()) return;
-    Object.assign(s, { deviceId, loadingDevice: true, buttons: [], configs: {}, sel: null, rows: [], dirty: false, msg: null });
+    if (s.editingLayout && !confirm("You're still editing this keypad's layout. Leave without saving it?")) return;
+    Object.assign(s, {
+      deviceId,
+      loadingDevice: true,
+      buttons: [],
+      configs: {},
+      sel: null,
+      rows: [],
+      dirty: false,
+      msg: null,
+      info: null,
+      layout: null,
+      layoutDraft: null,
+      editingLayout: false,
+    });
     this._render();
 
     try {
+      const [triggers, info] = await Promise.all([
+        this._triggers(deviceId),
+        this._hass.callWS({ type: "keypad_builder/lutron_info", device_id: deviceId }).catch(() => null),
+      ]);
       const groups = new Map();
-      for (const t of await this._triggers(deviceId)) {
+      for (const t of triggers) {
         const key = String(t.subtype);
         if (!groups.has(key)) groups.set(key, { key, subtype: t.subtype, label: pretty(t.subtype), triggers: {} });
         groups.get(key).triggers[t.type] = t;
       }
-      s.buttons = [...groups.values()];
+
+      // Use the processor's button order (and LED info) when the Lutron integration has it.
+      s.info = info;
+      const order = new Map((info?.buttons || []).map((b, i) => [String(b.subtype), { ...b, index: i }]));
+      s.buttons = [...groups.values()]
+        .map((b, i) => ({ ...b, number: order.get(b.key)?.number, led: !!order.get(b.key)?.led, index: order.get(b.key)?.index ?? 1000 + i }))
+        .sort((a, b) => a.index - b.index);
+      s.layout = reconcileLayout(s.layouts[deviceId] || autoLayout(s.buttons), s.buttons);
 
       await Promise.all(
         s.buttons.flatMap((b) =>
@@ -295,6 +408,40 @@ class KeypadBuilderPanel extends HTMLElement {
 
   _okToLeave() {
     return !this._s.dirty || confirm("You have unsaved changes for this button. Leave without saving?");
+  }
+
+  // ---------- layout ----------
+
+  _layoutLabel(key, layout = this._s.layoutDraft || this._s.layout) {
+    return layout?.labels[key] || this._s.buttons.find((b) => b.key === key)?.label || key;
+  }
+
+  _editLayout() {
+    const s = this._s;
+    s.layoutDraft = cloneLayout(s.layout);
+    s.editingLayout = true;
+    this._render();
+  }
+
+  _changeLayout(fn) {
+    fn(this._s.layoutDraft);
+    this._render();
+  }
+
+  async _saveLayout() {
+    const s = this._s;
+    const layout = reconcileLayout(s.layoutDraft, s.buttons);
+    try {
+      await this._hass.callWS({ type: "keypad_builder/layouts/save", device_id: s.deviceId, layout });
+      s.layouts[s.deviceId] = layout;
+      s.layout = layout;
+      s.layoutDraft = null;
+      s.editingLayout = false;
+      s.layoutMsg = null;
+    } catch (e) {
+      s.layoutMsg = `Couldn't save layout: ${e.message || e}`;
+    }
+    this._render();
   }
 
   _current() {
@@ -389,6 +536,9 @@ class KeypadBuilderPanel extends HTMLElement {
         case "device":
           return this._selectDevice(el.dataset.id);
         case "button":
+          if (s.editingLayout) {
+            return root.querySelector(`input[data-lkey="${CSS.escape(el.dataset.key)}"]`)?.focus();
+          }
           return this._selectButton(el.dataset.key);
         case "type":
           return this._selectButton(s.sel, el.dataset.type);
@@ -415,6 +565,33 @@ class KeypadBuilderPanel extends HTMLElement {
         case "reload":
           this._triggerCache.clear();
           return this._loadDevices();
+        case "theme":
+          return this._cycleTheme();
+        case "l-edit":
+          return this._editLayout();
+        case "l-cancel":
+          Object.assign(s, { editingLayout: false, layoutDraft: null, layoutMsg: null });
+          return this._render();
+        case "l-save":
+          return this._saveLayout();
+        case "l-reset":
+          return this._changeLayout((d) => Object.assign(d, autoLayout(s.buttons, d.finish)));
+        case "l-up":
+        case "l-down": {
+          const r = Number(el.dataset.r);
+          const t = el.dataset.act === "l-up" ? r - 1 : r + 1;
+          return this._changeLayout((d) => {
+            if (t >= 0 && t < d.rows.length) [d.rows[r], d.rows[t]] = [d.rows[t], d.rows[r]];
+          });
+        }
+        case "l-join": {
+          const r = Number(el.dataset.r);
+          return this._changeLayout((d) => d.rows.splice(r, 2, [...d.rows[r], ...d.rows[r + 1]]));
+        }
+        case "l-split": {
+          const r = Number(el.dataset.r);
+          return this._changeLayout((d) => d.rows.splice(r, 1, ...d.rows[r].map((k) => [k])));
+        }
       }
     });
 
@@ -424,6 +601,15 @@ class KeypadBuilderPanel extends HTMLElement {
       if (el.id === "search") {
         s.filter = el.value;
         return this._renderDeviceList();
+      }
+      if (el.dataset.lkey != null) {
+        const key = el.dataset.lkey;
+        const value = el.value.trim();
+        if (value) s.layoutDraft.labels[key] = value;
+        else delete s.layoutDraft.labels[key];
+        const label = root.querySelector(`.kbtn[data-key="${CSS.escape(key)}"] .label`);
+        if (label) label.textContent = this._layoutLabel(key);
+        return;
       }
       if (el.dataset.field == null) return;
       const row = s.rows[Number(el.dataset.row)];
@@ -446,6 +632,15 @@ class KeypadBuilderPanel extends HTMLElement {
       if (el.id === "all-devices") {
         s.allDevices = el.checked;
         return this._loadDevices();
+      }
+      if (el.dataset.lhide != null) {
+        const key = el.dataset.lhide;
+        return this._changeLayout((d) => {
+          d.hidden = el.checked ? [...d.hidden, key] : d.hidden.filter((k) => k !== key);
+        });
+      }
+      if (el.dataset.lfield === "finish") {
+        return this._changeLayout((d) => (d.finish = el.value));
       }
       if (el.dataset.kind != null) {
         const i = Number(el.dataset.kind);
@@ -475,6 +670,8 @@ class KeypadBuilderPanel extends HTMLElement {
       <div class="toolbar">
         <ha-menu-button></ha-menu-button>
         <div class="title">🎛️ Keypad Builder</div>
+        <span class="spacer"></span>
+        <button id="theme" class="icon theme" data-act="theme" title="Theme: ${this._themeMode}">${THEME_ICONS[this._themeMode]}</button>
       </div>
       <div class="layout">
         <section class="card devices">
@@ -535,34 +732,93 @@ class KeypadBuilderPanel extends HTMLElement {
     if (s.loadingDevice) return `<div class="empty">Loading buttons…</div>`;
     if (!s.buttons.length) return `<div class="empty">This device doesn't have any buttons HA can use as triggers.</div>`;
 
-    const btn = (b, extra = "") => {
+    const editing = s.editingLayout;
+    const layout = editing ? s.layoutDraft : s.layout;
+    const byKey = new Map(s.buttons.map((b) => [b.key, b]));
+
+    const btn = (b, small) => {
       const has = Object.keys(b.triggers).some((t) => s.configs[autoId(s.deviceId, b.subtype, t)]);
-      return `<button class="kbtn ${extra} ${b.key === s.sel ? "active" : ""} ${has ? "has" : ""}" data-act="button" data-key="${esc(b.key)}" title="${esc(b.label)}">
-        <span class="label">${esc(b.label)}</span><span class="dot"></span>
+      const hidden = layout.hidden.includes(b.key);
+      const label = this._layoutLabel(b.key, layout);
+      const cls = ["kbtn", small && "small", b.key === s.sel && !editing && "active", has && "has", hidden && "is-hidden", b.led && "with-led"];
+      return `<button class="${cls.filter(Boolean).join(" ")}" data-act="button" data-key="${esc(b.key)}" title="${esc(label)}">
+        ${b.led ? `<span class="led"></span>` : ""}<span class="label">${esc(label)}</span><span class="dot"></span>
       </button>`;
     };
 
-    const isRaise = (b) => /raise|up\b/i.test(b.label);
-    const isLower = (b) => /lower|down\b/i.test(b.label);
-    const parts = [];
-    for (let i = 0; i < s.buttons.length; i++) {
-      const b = s.buttons[i];
-      const next = s.buttons[i + 1];
-      if (next && ((isLower(b) && isRaise(next)) || (isRaise(b) && isLower(next)))) {
-        const [lo, hi] = isLower(b) ? [b, next] : [next, b];
-        parts.push(`<div class="pair">${btn(lo, "small")}${btn(hi, "small")}</div>`);
-        i++;
-      } else {
-        parts.push(btn(b));
-      }
-    }
+    const rows = layout.rows
+      .map((row) => row.map((k) => byKey.get(k)).filter((b) => b && (editing || !layout.hidden.includes(b.key))))
+      .filter((row) => row.length)
+      .map((row) => (row.length > 1 ? `<div class="pair">${row.map((b) => btn(b, true)).join("")}</div>` : btn(row[0])))
+      .join("");
+
+    const source = s.info
+      ? `<div class="source">📡 Button order &amp; names from your Lutron processor</div>`
+      : "";
 
     return `
-      <div class="device-name">${esc(device.name)}</div>
-      <div class="muted center">${esc(device.area || "")}${device.model ? ` · ${esc(device.model)}` : ""}</div>
-      <div class="faceplate">${parts.join("")}</div>
-      <div class="muted center legend"><span class="dot on"></span> has an automation</div>
+      <div class="card-head">
+        <div>
+          <div class="device-name">${esc(device.name)}</div>
+          <div class="muted">${esc(device.area || "")}${device.model ? ` · ${esc(device.model)}` : ""}</div>
+        </div>
+        ${editing ? "" : `<button class="ghost" data-act="l-edit">✏️ Edit layout</button>`}
+      </div>
+      ${source}
+      <div class="faceplate finish-${esc(layout.finish)}">${rows}</div>
+      ${
+        editing
+          ? this._renderLayoutEditor(layout, byKey)
+          : `<div class="muted center legend"><span class="dot on"></span> has an automation</div>`
+      }
     `;
+  }
+
+  _renderLayoutEditor(layout, byKey) {
+    const s = this._s;
+    const finishOptions = FINISHES.map(
+      ([v, l]) => `<option value="${v}" ${v === layout.finish ? "selected" : ""}>${esc(l)}</option>`
+    ).join("");
+    const last = layout.rows.length - 1;
+
+    const rows = layout.rows
+      .map(
+        (row, r) => `
+        <div class="lrow">
+          <div class="lrow-head">
+            <span class="muted">Row ${r + 1}</span>
+            <span class="spacer"></span>
+            ${row.length > 1 ? `<button class="icon" data-act="l-split" data-r="${r}" title="Put each button on its own row">Split</button>` : ""}
+            ${r < last ? `<button class="icon" data-act="l-join" data-r="${r}" title="Put the next row's buttons beside these">Join ↓</button>` : ""}
+            <button class="icon" data-act="l-up" data-r="${r}" title="Move row up" ${r === 0 ? "disabled" : ""}>↑</button>
+            <button class="icon" data-act="l-down" data-r="${r}" title="Move row down" ${r === last ? "disabled" : ""}>↓</button>
+          </div>
+          ${row
+            .map((k) => {
+              const b = byKey.get(k);
+              return `<div class="lbtn">
+                <input data-lkey="${esc(k)}" value="${esc(layout.labels[k] || "")}" placeholder="${esc(b?.label || k)}">
+                <label class="check" title="Hide this button on the faceplate"><input type="checkbox" data-lhide="${esc(k)}" ${layout.hidden.includes(k) ? "checked" : ""}> hide</label>
+              </div>`;
+            })
+            .join("")}
+        </div>`
+      )
+      .join("");
+
+    return `
+      <div class="layout-editor">
+        <div class="inline"><label>Finish</label><select data-lfield="finish">${finishOptions}</select></div>
+        <p class="muted">Rename buttons, move rows, or join rows so buttons sit side by side. Names here are just for this page, your automations don't change.</p>
+        ${rows}
+        ${s.layoutMsg ? `<div class="msg error">${esc(s.layoutMsg)}</div>` : ""}
+        <div class="footer">
+          <button class="ghost" data-act="l-reset" title="Go back to the order from your processor">↺ Reset</button>
+          <span class="spacer"></span>
+          <button class="ghost" data-act="l-cancel">Cancel</button>
+          <button class="primary" data-act="l-save">Save layout</button>
+        </div>
+      </div>`;
   }
 
   _renderEditor() {
@@ -677,43 +933,63 @@ class KeypadBuilderPanel extends HTMLElement {
 }
 
 const STYLES = `
+  /* Auto: borrow Home Assistant's theme so we match light/dark automatically. */
   :host {
-    display: block;
-    min-height: 100vh;
-    background: var(--primary-background-color, #f5f5f7);
-    color: var(--primary-text-color, #1c1c1e);
-    font-family: var(--paper-font-body1_-_font-family, system-ui, sans-serif);
-    --kb-radius: 14px;
-    --kb-accent: var(--primary-color, #03a9f4);
+    --kb-bg: var(--primary-background-color, #f5f5f7);
     --kb-card: var(--card-background-color, #fff);
-    --kb-border: var(--divider-color, rgba(0,0,0,.12));
+    --kb-text: var(--primary-text-color, #1c1c1e);
     --kb-muted: var(--secondary-text-color, #6b6b70);
+    --kb-border: var(--divider-color, rgba(0,0,0,.12));
+    --kb-input: var(--primary-background-color, #fafafa);
+    --kb-header: var(--app-header-background-color, var(--kb-card));
+    --kb-header-text: var(--app-header-text-color, var(--kb-text));
+    --kb-accent: var(--primary-color, #03a9f4);
+    --kb-on-accent: var(--text-primary-color, #fff);
     --kb-on: var(--success-color, #43a047);
     --kb-error: var(--error-color, #db4437);
+    --kb-radius: 14px;
+
+    display: block;
+    min-height: 100vh;
+    background: var(--kb-bg);
+    color: var(--kb-text);
+    font-family: var(--paper-font-body1_-_font-family, system-ui, sans-serif);
   }
+  /* Forced themes from the ☀️/🌙 button, independent of HA's theme. */
+  :host([mode="light"]) {
+    --kb-bg: #f5f5f7; --kb-card: #ffffff; --kb-text: #1c1c1e; --kb-muted: #6b6b70;
+    --kb-border: rgba(0,0,0,.12); --kb-input: #fafafa; --kb-header: #ffffff; --kb-header-text: #1c1c1e;
+  }
+  :host([mode="dark"]) {
+    --kb-bg: #111114; --kb-card: #1c1c20; --kb-text: #ececf0; --kb-muted: #9a9aa3;
+    --kb-border: rgba(255,255,255,.12); --kb-input: #26262b; --kb-header: #1c1c20; --kb-header-text: #ececf0;
+  }
+  :host([dark]) { color-scheme: dark; }
+
   * { box-sizing: border-box; }
   .toolbar {
     display: flex; align-items: center; gap: 8px; height: 56px; padding: 0 16px;
-    background: var(--app-header-background-color, var(--kb-card));
-    color: var(--app-header-text-color, inherit);
+    background: var(--kb-header); color: var(--kb-header-text);
     border-bottom: 1px solid var(--kb-border);
   }
   .title { font-size: 20px; font-weight: 500; }
+  .theme { font-size: 18px; color: inherit; }
   .layout {
     display: grid; gap: 16px; padding: 16px;
-    grid-template-columns: minmax(220px, 280px) minmax(240px, 320px) minmax(0, 1fr);
+    grid-template-columns: minmax(220px, 280px) minmax(260px, 340px) minmax(0, 1fr);
     align-items: start;
   }
   @media (max-width: 1000px) { .layout { grid-template-columns: 1fr 1fr; } .editor { grid-column: 1 / -1; } }
   @media (max-width: 640px) { .layout { grid-template-columns: 1fr; } }
   .card { background: var(--kb-card); border: 1px solid var(--kb-border); border-radius: var(--kb-radius); padding: 16px; min-width: 0; }
-  .card-head { display: flex; align-items: center; justify-content: space-between; }
+  .card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
   h2 { margin: 0 0 12px; font-size: 18px; font-weight: 600; }
   .muted { color: var(--kb-muted); font-size: 13px; }
   .center { text-align: center; }
   .empty { color: var(--kb-muted); text-align: center; padding: 48px 8px; }
+  .spacer { flex: 1; }
   input, select, textarea {
-    font: inherit; color: inherit; background: var(--primary-background-color, #fafafa);
+    font: inherit; color: inherit; background: var(--kb-input);
     border: 1px solid var(--kb-border); border-radius: 10px; padding: 8px 10px; min-width: 0;
   }
   textarea { width: 100%; font-family: ui-monospace, monospace; font-size: 13px; resize: vertical; }
@@ -721,9 +997,11 @@ const STYLES = `
   #search { width: 100%; margin-bottom: 8px; }
   .check { display: flex; gap: 6px; align-items: center; font-size: 13px; color: var(--kb-muted); margin-bottom: 8px; }
   button { font: inherit; cursor: pointer; color: inherit; }
-  button:disabled { opacity: .5; cursor: default; }
-  .icon { background: none; border: none; border-radius: 8px; padding: 4px 8px; font-size: 15px; color: var(--kb-muted); }
-  .icon:hover { background: var(--kb-border); }
+  button:disabled { opacity: .4; cursor: default; }
+  .icon { background: none; border: none; border-radius: 8px; padding: 4px 8px; font-size: 14px; color: var(--kb-muted); }
+  .icon:hover:not(:disabled) { background: var(--kb-border); }
+  .ghost { background: none; border: 1px solid var(--kb-border); border-radius: 10px; padding: 7px 12px; font-size: 13px; white-space: nowrap; }
+  .ghost:hover { border-color: var(--kb-accent); }
   .area { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--kb-muted); margin: 12px 4px 4px; }
   .dev {
     display: flex; flex-direction: column; align-items: flex-start; width: 100%; text-align: left;
@@ -732,35 +1010,65 @@ const STYLES = `
   .dev small { color: var(--kb-muted); }
   .dev:hover { background: var(--kb-border); }
   .dev.active { border-color: var(--kb-accent); background: color-mix(in srgb, var(--kb-accent) 12%, transparent); }
-  .device-name { text-align: center; font-weight: 600; font-size: 17px; }
+  .device-name { font-weight: 600; font-size: 17px; }
+  .source { margin-top: 10px; font-size: 12px; color: var(--kb-muted); }
+
+  /* ---- faceplate ---- */
   .faceplate {
-    margin: 16px auto; width: 200px; padding: 28px 22px; border-radius: 18px;
-    background: linear-gradient(160deg, #fdfdfb, #ecebe6);
-    box-shadow: 0 1px 0 #fff inset, 0 8px 24px rgba(0,0,0,.18), 0 0 0 1px rgba(0,0,0,.08);
+    --fp-top: #fdfdfb; --fp-bottom: #ecebe6; --fp-btn-top: #ffffff; --fp-btn-bottom: #f1f0eb;
+    --fp-text: #3a3a3c; --fp-edge: rgba(0,0,0,.14);
+    margin: 16px auto; width: 210px; padding: 28px 22px; border-radius: 18px;
+    background: linear-gradient(160deg, var(--fp-top), var(--fp-bottom));
+    box-shadow: 0 1px 0 rgba(255,255,255,.5) inset, 0 8px 24px rgba(0,0,0,.25), 0 0 0 1px rgba(0,0,0,.1);
     display: flex; flex-direction: column; gap: 10px;
   }
+  .finish-ivory { --fp-top: #fbf7ec; --fp-bottom: #ece4cf; --fp-btn-top: #fdf9ef; --fp-btn-bottom: #efe8d6; --fp-text: #4a4436; }
+  .finish-gray { --fp-top: #a9aaa8; --fp-bottom: #8c8d8b; --fp-btn-top: #b3b4b2; --fp-btn-bottom: #999a98; --fp-text: #222; }
+  .finish-black, :host([dark]) .finish-auto {
+    --fp-top: #2c2c2e; --fp-bottom: #161617; --fp-btn-top: #313133; --fp-btn-bottom: #1f1f21;
+    --fp-text: #d6d6d8; --fp-edge: rgba(255,255,255,.08);
+  }
+  .finish-brass { --fp-top: #d9c18a; --fp-bottom: #a88a4c; --fp-btn-top: #e2cc98; --fp-btn-bottom: #b99a5a; --fp-text: #3b2f16; }
+  .finish-nickel { --fp-top: #dcdddf; --fp-bottom: #a9abaf; --fp-btn-top: #e5e6e8; --fp-btn-bottom: #b6b8bc; --fp-text: #2e3034; }
   .kbtn {
     position: relative; display: flex; align-items: center; justify-content: center;
-    width: 100%; min-height: 44px; padding: 6px 18px; border-radius: 8px;
-    background: linear-gradient(#ffffff, #f1f0eb); color: #3a3a3c;
-    border: 1px solid rgba(0,0,0,.14); box-shadow: 0 2px 3px rgba(0,0,0,.08);
+    width: 100%; min-height: 44px; padding: 6px 20px; border-radius: 8px;
+    background: linear-gradient(var(--fp-btn-top), var(--fp-btn-bottom)); color: var(--fp-text);
+    border: 1px solid var(--fp-edge); box-shadow: 0 2px 3px rgba(0,0,0,.15);
     font-size: 12px; letter-spacing: .08em; text-transform: uppercase;
     transition: transform .08s, box-shadow .15s;
   }
   .kbtn .label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .kbtn:hover { box-shadow: 0 2px 6px rgba(0,0,0,.18); }
+  .kbtn:hover { box-shadow: 0 2px 8px rgba(0,0,0,.28); }
   .kbtn:active { transform: translateY(1px); }
   .kbtn.active { outline: 3px solid var(--kb-accent); outline-offset: 2px; }
+  .kbtn.is-hidden { opacity: .35; border-style: dashed; }
   .kbtn .dot { position: absolute; right: 8px; top: 50%; translate: 0 -50%; }
   .kbtn.has .dot { background: var(--kb-on); }
+  .kbtn .led {
+    position: absolute; left: 8px; top: 50%; translate: 0 -50%;
+    width: 4px; height: 12px; border-radius: 2px; background: color-mix(in srgb, var(--fp-text) 30%, transparent);
+  }
   .pair { display: flex; gap: 8px; }
-  .kbtn.small { min-height: 34px; padding: 4px 18px 4px 8px; font-size: 11px; }
+  .kbtn.small { min-height: 34px; padding: 4px 16px; font-size: 11px; }
+  .kbtn.small.with-led { padding-left: 18px; padding-right: 14px; letter-spacing: .04em; }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: transparent; vertical-align: middle; }
   .dot.on { background: var(--kb-on); }
   .legend { margin-top: 4px; }
+
+  /* ---- layout editor ---- */
+  .layout-editor { display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--kb-border); padding-top: 12px; }
+  .layout-editor p { margin: 0; }
+  .lrow { border: 1px solid var(--kb-border); border-radius: 12px; padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+  .lrow-head { display: flex; align-items: center; gap: 2px; }
+  .lbtn { display: flex; align-items: center; gap: 8px; }
+  .lbtn input:not([type]) { flex: 1; }
+  .lbtn .check { margin: 0; }
+
+  /* ---- action editor ---- */
   .tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
   .tab { border: 1px solid var(--kb-border); background: none; border-radius: 999px; padding: 6px 14px; }
-  .tab.active { background: var(--kb-accent); border-color: var(--kb-accent); color: var(--text-primary-color, #fff); }
+  .tab.active { background: var(--kb-accent); border-color: var(--kb-accent); color: var(--kb-on-accent); }
   .rows { display: flex; flex-direction: column; gap: 10px; margin: 8px 0 12px; }
   .empty-rows { padding: 16px; border: 1px dashed var(--kb-border); border-radius: 12px; text-align: center; }
   .row { border: 1px solid var(--kb-border); border-radius: 12px; padding: 10px; }
@@ -768,22 +1076,23 @@ const STYLES = `
   .row-head select { flex: 1; }
   .num {
     flex: none; width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center;
-    background: var(--kb-accent); color: var(--text-primary-color, #fff); font-size: 12px; font-weight: 600;
+    background: var(--kb-accent); color: var(--kb-on-accent); font-size: 12px; font-weight: 600;
   }
   .row-body { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; padding-left: 30px; }
   .grow { width: 100%; }
-  .hint { font-size: 12px; color: var(--kb-muted); margin-top: -4px; min-height: 0; }
+  .hint { font-size: 12px; color: var(--kb-muted); margin-top: -4px; }
   .hint:empty { display: none; }
   .inline { display: flex; align-items: center; gap: 10px; }
   .inline label { font-size: 13px; color: var(--kb-muted); min-width: 80px; }
   .inline input[type=range] { flex: 1; }
   .inline input[type=number] { width: 110px; }
+  .inline select { flex: 1; }
   .val { min-width: 40px; text-align: right; font-variant-numeric: tabular-nums; }
   .add { width: 100%; padding: 10px; border: 1px dashed var(--kb-accent); color: var(--kb-accent); background: none; border-radius: 12px; }
   .add:hover { background: color-mix(in srgb, var(--kb-accent) 8%, transparent); }
   .footer { display: flex; align-items: center; gap: 10px; margin-top: 16px; }
-  .spacer { flex: 1; }
-  .primary { background: var(--kb-accent); color: var(--text-primary-color, #fff); border: none; border-radius: 10px; padding: 10px 22px; font-weight: 600; }
+  .layout-editor .footer { margin-top: 4px; }
+  .primary { background: var(--kb-accent); color: var(--kb-on-accent); border: none; border-radius: 10px; padding: 10px 22px; font-weight: 600; }
   .danger { background: none; color: var(--kb-error); border: 1px solid var(--kb-error); border-radius: 10px; padding: 9px 16px; }
   .msg { margin-top: 12px; padding: 10px 12px; border-radius: 10px; font-size: 14px; }
   .msg.ok { background: color-mix(in srgb, var(--kb-on) 14%, transparent); }

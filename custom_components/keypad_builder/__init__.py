@@ -8,6 +8,8 @@ from homeassistant.components import frontend, panel_custom
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.typing import ConfigType
 
 from .const import (
     DOMAIN,
@@ -18,6 +20,16 @@ from .const import (
     STATIC_URL,
     VERSION,
 )
+from .websocket import async_setup_websocket
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up layout storage and the websocket API."""
+    hass.data.setdefault(DOMAIN, {})
+    await async_setup_websocket(hass)
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
