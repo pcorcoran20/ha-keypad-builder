@@ -89,11 +89,15 @@ const FINISHES = [
   ["black", "Black"],
   ["brass", "Brass"],
   ["nickel", "Nickel"],
+  ["glass", "Smoked glass"],
+  ["frost", "Frosted glass"],
 ];
 
-const THEME_KEY = "keypad-builder-theme";
-const THEME_MODES = ["auto", "light", "dark"];
-const THEME_ICONS = { auto: "🌗", light: "☀️", dark: "🌙" };
+// new key so everyone starts on the glass look once, whatever they picked before
+const THEME_KEY = "keypad-builder-look";
+const THEME_MODES = ["glass", "auto", "light", "dark"];
+const THEME_ICONS = { glass: "💎", auto: "🌗", light: "☀️", dark: "🌙" };
+const THEME_NAMES = { glass: "Liquid glass", auto: "Match Home Assistant", light: "Light", dark: "Dark" };
 
 const isRaise = (label) => /^(raise|up)\b/i.test(label);
 const isLower = (label) => /^(lower|down)\b/i.test(label);
@@ -219,9 +223,9 @@ function splitDeviceName(name, area) {
 function loadThemeMode() {
   try {
     const mode = localStorage.getItem(THEME_KEY);
-    return THEME_MODES.includes(mode) ? mode : "auto";
+    return THEME_MODES.includes(mode) ? mode : "glass";
   } catch (e) {
-    return "auto";
+    return "glass";
   }
 }
 
@@ -428,7 +432,8 @@ class KeypadBuilderPanel extends HTMLElement {
 
   // Host attributes drive the CSS: mode = what the user picked, dark = what's showing.
   _applyTheme() {
-    const dark = this._themeMode === "dark" || (this._themeMode === "auto" && !!this._hass?.themes?.darkMode);
+    const mode = this._themeMode;
+    const dark = mode === "dark" || mode === "glass" || (mode === "auto" && !!this._hass?.themes?.darkMode);
     this.setAttribute("mode", this._themeMode);
     this.toggleAttribute("dark", dark);
   }
@@ -444,7 +449,7 @@ class KeypadBuilderPanel extends HTMLElement {
     const btn = this.shadowRoot.querySelector("#theme");
     if (btn) {
       btn.textContent = THEME_ICONS[this._themeMode];
-      btn.title = `Theme: ${this._themeMode}`;
+      btn.title = `Look: ${THEME_NAMES[this._themeMode]} (tap to change)`;
     }
   }
 
@@ -1639,7 +1644,7 @@ class KeypadBuilderPanel extends HTMLElement {
         <ha-menu-button></ha-menu-button>
         <div class="title">🎛️ Keypad Builder</div>
         <span class="spacer"></span>
-        <button id="theme" class="icon theme" data-act="theme" title="Theme: ${this._themeMode}">${THEME_ICONS[this._themeMode]}</button>
+        <button id="theme" class="icon theme" data-act="theme" title="Look: ${THEME_NAMES[this._themeMode]} (tap to change)">${THEME_ICONS[this._themeMode]}</button>
       </div>
       <div class="layout">
         <section class="card devices">
@@ -2804,6 +2809,166 @@ const STYLES = `
   .msg { margin-top: 12px; padding: 10px 12px; border-radius: 10px; font-size: 14px; }
   .msg.ok { background: color-mix(in srgb, var(--kb-on) 14%, transparent); }
   .msg.error { background: color-mix(in srgb, var(--kb-error) 14%, transparent); color: var(--kb-error); }
+
+  /* ---- glass faceplate finishes (work in every theme) ---- */
+  .finish-glass, :host([mode="glass"]) .finish-auto {
+    --fp-top: rgba(70, 76, 98, .55); --fp-bottom: rgba(14, 16, 26, .78);
+    --fp-btn-top: rgba(255, 255, 255, .13); --fp-btn-bottom: rgba(255, 255, 255, .04);
+    --fp-text: rgba(255, 255, 255, .9); --fp-edge: rgba(255, 255, 255, .16);
+  }
+  .finish-frost {
+    --fp-top: rgba(255, 255, 255, .55); --fp-bottom: rgba(225, 232, 245, .32);
+    --fp-btn-top: rgba(255, 255, 255, .7); --fp-btn-bottom: rgba(255, 255, 255, .35);
+    --fp-text: #1d2130; --fp-edge: rgba(255, 255, 255, .6);
+  }
+  .wallplate.finish-glass, .wallplate.finish-frost, :host([mode="glass"]) .wallplate.finish-auto {
+    position: relative; backdrop-filter: blur(22px) saturate(160%); -webkit-backdrop-filter: blur(22px) saturate(160%);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.35), inset 0 0 0 1px rgba(255,255,255,.12), 0 24px 60px rgba(0,0,0,.5);
+  }
+  /* a soft reflection across the glass */
+  .wallplate.finish-glass::after, .wallplate.finish-frost::after, :host([mode="glass"]) .wallplate.finish-auto::after {
+    content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+    background: linear-gradient(115deg, rgba(255,255,255,.18) 0%, rgba(255,255,255,0) 32%, rgba(255,255,255,0) 68%, rgba(255,255,255,.06) 100%);
+  }
+  .finish-glass .faceplate, .finish-frost .faceplate, :host([mode="glass"]) .finish-auto .faceplate { box-shadow: inset 0 0 0 1px var(--fp-edge); }
+  .finish-glass .kbtn, :host([mode="glass"]) .finish-auto .kbtn {
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.22), 0 4px 14px rgba(0,0,0,.25);
+    backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+  }
+  .finish-glass .kbtn .led.lit, :host([mode="glass"]) .finish-auto .kbtn .led.lit {
+    background: #e9fbff; box-shadow: 0 0 8px 3px rgba(140, 220, 255, .85);
+  }
+
+  /* ---- 💎 Liquid glass look ---- */
+  :host([mode="glass"]) {
+    --kb-bg: #07080d;
+    --kb-card: rgba(255, 255, 255, .055);
+    --kb-text: #f3f4f8;
+    --kb-muted: rgba(235, 236, 245, .58);
+    --kb-border: rgba(255, 255, 255, .11);
+    --kb-input: rgba(255, 255, 255, .06);
+    --kb-header: rgba(14, 15, 22, .55);
+    --kb-header-text: #f3f4f8;
+    --kb-accent: #7aa2ff;
+    --kb-on-accent: #fff;
+    --kb-on: #4ade80;
+    --kb-other: #38bdf8;
+    --kb-shared: #c084fc;
+    --kb-error: #fb7185;
+    --kb-radius: 22px;
+    --kb-glow: 0 0 0 1px rgba(122, 162, 255, .55), 0 0 24px rgba(122, 162, 255, .35);
+    --kb-shine: linear-gradient(135deg, #8b9dff 0%, #6fc3ff 55%, #8ef0e0 100%);
+    --kb-ease: cubic-bezier(.2, .8, .2, 1);
+    font-family: "SF Pro Display", "SF Pro Text", Inter, "Segoe UI Variable", system-ui, sans-serif;
+    letter-spacing: -.005em;
+    background:
+      radial-gradient(1100px 760px at 8% -12%, rgba(99, 102, 241, .32), transparent 60%),
+      radial-gradient(900px 680px at 105% 8%, rgba(20, 184, 166, .2), transparent 60%),
+      radial-gradient(900px 900px at 55% 125%, rgba(168, 85, 247, .24), transparent 62%),
+      #07080d;
+    background-attachment: fixed;
+  }
+  :host([mode="glass"]) h2, :host([mode="glass"]) .device-name, :host([mode="glass"]) .title { letter-spacing: -.02em; }
+
+  /* frosted panels with light catching the top edge */
+  :host([mode="glass"]) .card,
+  :host([mode="glass"]) .picker {
+    background: linear-gradient(160deg, rgba(255,255,255,.085), rgba(255,255,255,.025));
+    border: 1px solid rgba(255,255,255,.12);
+    backdrop-filter: blur(28px) saturate(170%); -webkit-backdrop-filter: blur(28px) saturate(170%);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.2), inset 0 -1px 0 rgba(255,255,255,.03), 0 24px 60px rgba(0,0,0,.45);
+  }
+  :host([mode="glass"]) .card::before,
+  :host([mode="glass"]) .picker::before {
+    content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none;
+    background: linear-gradient(180deg, rgba(255,255,255,.07), transparent 38%);
+  }
+  :host([mode="glass"]) .card { position: relative; padding: 20px; }
+  :host([mode="glass"]) .picker { background: linear-gradient(160deg, rgba(40,42,58,.78), rgba(14,15,24,.86)); }
+  :host([mode="glass"]) .picker-backdrop { background: rgba(4, 5, 10, .5); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
+  :host([mode="glass"]) .toolbar {
+    position: sticky; top: 0; z-index: 5;
+    backdrop-filter: blur(24px) saturate(170%); -webkit-backdrop-filter: blur(24px) saturate(170%);
+    border-bottom: 1px solid rgba(255,255,255,.08);
+  }
+  :host([mode="glass"]) .layout { gap: 20px; padding: 20px; }
+
+  /* inputs */
+  :host([mode="glass"]) input, :host([mode="glass"]) select, :host([mode="glass"]) textarea, :host([mode="glass"]) .entity-field {
+    border-radius: 12px; border-color: rgba(255,255,255,.1);
+    box-shadow: inset 0 1px 2px rgba(0,0,0,.25);
+    transition: border-color .2s var(--kb-ease), box-shadow .2s var(--kb-ease), background .2s var(--kb-ease);
+  }
+  :host([mode="glass"]) input:focus, :host([mode="glass"]) select:focus, :host([mode="glass"]) textarea:focus {
+    outline: none; border-color: rgba(122,162,255,.6); box-shadow: var(--kb-glow);
+  }
+  :host([mode="glass"]) .entity-field:hover { background: rgba(255,255,255,.09); }
+  :host([mode="glass"]) select option { background: #161824; }
+
+  /* glossy primary buttons */
+  :host([mode="glass"]) .primary, :host([mode="glass"]) .tab.active, :host([mode="glass"]) .tchip.on, :host([mode="glass"]) .bp-btn.on {
+    background: var(--kb-shine); border-color: transparent; color: #0b0d18; font-weight: 600;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.55), 0 8px 24px rgba(111, 160, 255, .35);
+  }
+  :host([mode="glass"]) .primary { border-radius: 14px; transition: transform .18s var(--kb-ease), box-shadow .18s var(--kb-ease), filter .18s; }
+  :host([mode="glass"]) .primary:hover:not(:disabled) { transform: translateY(-1px); filter: brightness(1.06); box-shadow: inset 0 1px 0 rgba(255,255,255,.6), 0 12px 32px rgba(111,160,255,.5); }
+  :host([mode="glass"]) .primary:active:not(:disabled) { transform: translateY(0) scale(.98); }
+  :host([mode="glass"]) .ghost, :host([mode="glass"]) .tab, :host([mode="glass"]) .tchip, :host([mode="glass"]) .bp-btn {
+    background: rgba(255,255,255,.05); border-color: rgba(255,255,255,.12);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.08);
+    transition: background .2s var(--kb-ease), border-color .2s var(--kb-ease), transform .15s var(--kb-ease);
+  }
+  :host([mode="glass"]) .ghost:hover, :host([mode="glass"]) .tab:hover, :host([mode="glass"]) .tchip:hover { background: rgba(255,255,255,.1); border-color: rgba(255,255,255,.22); }
+  :host([mode="glass"]) .add {
+    border: 1px dashed rgba(122,162,255,.45); background: rgba(122,162,255,.06); border-radius: 16px;
+    transition: background .2s var(--kb-ease), border-color .2s var(--kb-ease);
+  }
+  :host([mode="glass"]) .add:hover { background: rgba(122,162,255,.13); border-color: rgba(122,162,255,.75); }
+  :host([mode="glass"]) .danger { border-radius: 14px; background: rgba(251,113,133,.06); }
+
+  /* lists, rows, tiles */
+  :host([mode="glass"]) .dev { border-radius: 14px; transition: background .2s var(--kb-ease), border-color .2s var(--kb-ease); }
+  :host([mode="glass"]) .dev:hover { background: rgba(255,255,255,.06); }
+  :host([mode="glass"]) .dev.active {
+    background: linear-gradient(135deg, rgba(122,162,255,.2), rgba(142,240,224,.08));
+    border-color: rgba(122,162,255,.5); box-shadow: inset 0 1px 0 rgba(255,255,255,.12);
+  }
+  :host([mode="glass"]) .row, :host([mode="glass"]) .lrow, :host([mode="glass"]) .member,
+  :host([mode="glass"]) .related, :host([mode="glass"]) .choice {
+    border-radius: 16px; background: rgba(255,255,255,.035); border-color: rgba(255,255,255,.09);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.06);
+  }
+  :host([mode="glass"]) .num { background: var(--kb-shine); color: #0b0d18; box-shadow: 0 0 12px rgba(111,160,255,.45); }
+  :host([mode="glass"]) .tile {
+    border-radius: 16px; background: rgba(255,255,255,.045); border-color: rgba(255,255,255,.1);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.08);
+    transition: transform .18s var(--kb-ease), background .18s var(--kb-ease), border-color .18s var(--kb-ease), box-shadow .18s var(--kb-ease);
+  }
+  :host([mode="glass"]) .tile:hover { transform: translateY(-2px); background: rgba(255,255,255,.08); border-color: rgba(255,255,255,.2); }
+  :host([mode="glass"]) .tile.on {
+    background: linear-gradient(145deg, rgba(122,162,255,.26), rgba(142,240,224,.1));
+    border-color: rgba(122,162,255,.65); box-shadow: inset 0 1px 0 rgba(255,255,255,.18), 0 8px 26px rgba(111,160,255,.25);
+  }
+  :host([mode="glass"]) .tile.on .tile-check { background: var(--kb-shine); border-color: transparent; color: #0b0d18; }
+  :host([mode="glass"]) .chip { background: rgba(122,162,255,.18); }
+  :host([mode="glass"]) .chip.on { background: rgba(74,222,128,.18); }
+  :host([mode="glass"]) .ef-chip { background: rgba(122,162,255,.16); border: 1px solid rgba(122,162,255,.22); }
+  :host([mode="glass"]) .msg { border-radius: 14px; border: 1px solid rgba(255,255,255,.08); }
+
+  /* glowing status dots + selected button */
+  :host([mode="glass"]) .dot.on, :host([mode="glass"]) .kbtn.has .dot { box-shadow: 0 0 8px rgba(74,222,128,.8); }
+  :host([mode="glass"]) .dot.shared, :host([mode="glass"]) .kbtn.has-shared .dot { box-shadow: 0 0 8px rgba(192,132,252,.8); }
+  :host([mode="glass"]) .dot.other, :host([mode="glass"]) .kbtn.has-other .dot { box-shadow: 0 0 8px rgba(56,189,248,.8); }
+  :host([mode="glass"]) .kbtn.active { outline: none; box-shadow: var(--kb-glow), inset 0 1px 0 rgba(255,255,255,.25); }
+  :host([mode="glass"]) .wallplate.ganged .faceplate.current { box-shadow: var(--kb-glow); }
+  :host([mode="glass"]) .kbtn { transition: transform .15s var(--kb-ease), box-shadow .2s var(--kb-ease); }
+
+  /* gentle entrance for panels */
+  @keyframes kb-rise { from { opacity: 0; transform: translateY(8px) scale(.995); } to { opacity: 1; transform: none; } }
+  :host([mode="glass"]) .picker { animation: kb-rise .28s var(--kb-ease); }
+  @media (prefers-reduced-motion: reduce) {
+    :host([mode="glass"]) * { animation: none !important; transition: none !important; }
+  }
 `;
 
 customElements.define("keypad-builder-panel", KeypadBuilderPanel);

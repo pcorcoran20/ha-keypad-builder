@@ -2,6 +2,17 @@
 
 Release notes for each version. The Release workflow copies the matching section into the GitHub release, which is what HACS shows as the "release announcement".
 
+## v1.1.0
+
+### 💎 Liquid glass
+- A new **Liquid glass** look: frosted see-through panels over a soft glowing background, light catching the glass edges, glossy buttons and smooth hover and press animations
+- It's the new default look. Tap the 💎 button (top right) to switch between 💎 Liquid glass, 🌗 Match Home Assistant, ☀️ Light and 🌙 Dark
+- New faceplate finishes: **Smoked glass** and **Frosted glass**. In the glass look, "Match light/dark mode" uses smoked glass
+- Animations switch off if your device has "reduce motion" turned on
+
+### ⬆️ Updating
+HACS → Keypad Builder → Update → restart Home Assistant → hard refresh your browser
+
 ## v1.0.0
 
 The big redesign 🎉

@@ -19,7 +19,7 @@ Pick a keypad → tap a button on the faceplate → choose what it does → **Sa
 - Each button + press/release is saved as a **normal Home Assistant automation**, so you can still see and edit it in *Settings → Automations*
 - A green dot shows which buttons already have something set up
 - 📡 **Pulls your RA3 programming:** button order and engraving text come straight from your Lutron processor (whatever you set up in Lutron Designer)
-- ✏️ **Layout editor:** drag buttons around, rename or hide them, and pick a style and finish (white, ivory, gray, black, brass, nickel)
+- ✏️ **Layout editor:** drag buttons around, rename or hide them, and pick a style and finish (white, ivory, gray, black, brass, nickel, smoked glass, frosted glass)
 - 💡 **LED control:** make a button's LED follow any device (like "LED on when the kitchen lights are on"), or turn LEDs on/off as button actions. Faceplate LEDs glow live in the panel
 - 🔧 **Works with HA's automation editor:** open any button's automation in the full HA editor to add conditions or fancy steps, and Keypad Builder keeps them
 - 🔗 **Existing automations:** fire any automation you already have from a button ("Run another automation"), and see which other automations already use each button (blue dot), with links to open them
@@ -27,7 +27,7 @@ Pick a keypad → tap a button on the faceplate → choose what it does → **Sa
 - 📥 **Import existing automations:** bring automations you made before into the builder with one tap. They keep their name, conditions and settings
 - 🔢 **See what's set up:** keypads show a "3 set up" badge, and you can sort by **Set up first**
 - 🗂️ **Organized automations:** each one gets its keypad's **area**, a **Keypads** category and a **Keypad Builder** label, plus names that sort nicely ("Patrick's Office · Entry · Bright · pressed"). If a keypad moves rooms, its automations follow. Tap 🧹 to tidy up ones made with older versions
-- 🌙 **Dark mode:** follows your HA theme automatically, or tap the 🌗 button to force light/dark
+- 💎 **Liquid glass look** (the default), plus Match Home Assistant, Light and Dark. Tap the button in the top right to switch
 
 ### Actions you can pick
 
