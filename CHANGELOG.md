@@ -2,6 +2,19 @@
 
 Release notes for each version. The Release workflow copies the matching section into the GitHub release, which is what HACS shows as the "release announcement".
 
+## v0.7.0
+
+### 📥 Import existing automations
+- Automations you made before Keypad Builder now have an **Import** button in a button's "Other automations using this button" list
+- One that uses just that button becomes its actions in Keypad Builder. If the button already has actions, the imported ones get added after them
+- One that uses several buttons (or buttons plus other triggers) becomes a 🔗 shared action
+- The name, conditions and settings all come along
+- Pick **Move it** (the original is removed, so nothing runs twice) or **Copy it** (the original stays, but gets turned off)
+- Automations that mix pressed and released, or live in YAML files, can't be imported. The window says why and links to Home Assistant instead
+
+### ⬆️ Updating
+HACS → Keypad Builder → Update → restart Home Assistant → hard refresh your browser
+
 ## v0.6.2
 
 Same features as v0.6.1, just some repo housekeeping 🧹

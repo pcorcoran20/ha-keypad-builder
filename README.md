@@ -21,6 +21,7 @@ Pick a keypad → tap a button on the faceplate → choose what it does → **Sa
 - 🔧 **Works with HA's automation editor:** open any button's automation in the full HA editor to add conditions or fancy steps, and Keypad Builder keeps them
 - 🔗 **Existing automations:** fire any automation you already have from a button ("Run another automation"), and see which other automations already use each button (blue dot), with links to open them
 - 🔗 **Shared actions:** pick buttons from any keypads and give them one set of actions ("Movie time" on the bedroom, office and living room keypads). It's one automation, so you change it once and every button updates. Start one from scratch, or from a button with "Share this button's actions…"
+- 📥 **Import existing automations:** bring automations you made before into the builder with one tap. They keep their name, conditions and settings
 - 🔢 **See what's set up:** keypads show a "3 set up" badge, and you can sort by **Set up first**
 - 🗂️ **Organized automations:** each one gets its keypad's **area**, a **Keypads** category and a **Keypad Builder** label, plus names that sort nicely ("Patrick's Office · Entry · Bright · pressed"). If a keypad moves rooms, its automations follow. Tap 🧹 to tidy up ones made with older versions
 - 🌙 **Dark mode:** follows your HA theme automatically, or tap the 🌗 button to force light/dark

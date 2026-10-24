@@ -804,6 +804,163 @@ class KeypadBuilderPanel extends HTMLElement {
     this._render();
   }
 
+  // ---------- importing automations made outside the builder ----------
+
+  async _openImport(relatedId) {
+    const s = this._s;
+    const related = s.related.find((r) => r.id === relatedId);
+    if (!related || !this._okToLeave()) return;
+    this._imp = { related, loading: true, mode: "move" };
+    this._render();
+    try {
+      const config = await this._hass.callApi("GET", `config/automation/config/${related.id}`);
+      Object.assign(this._imp, this._planImport(config), { config });
+    } catch (e) {
+      this._imp.blocked =
+        "This one lives in a YAML file that Home Assistant's editor can't change, so it can't be imported. You can copy its actions over by hand.";
+    }
+    this._imp.loading = false;
+    this._render();
+  }
+
+  // Work out what an outside automation turns into: one button's actions, or a shared action.
+  _planImport(config) {
+    const s = this._s;
+    const isButton = (t) => (t.trigger || t.platform) === "device" && t.device_id && t.subtype != null;
+    const triggers = [].concat(config.triggers ?? config.trigger ?? []);
+    const buttons = triggers.filter(isButton);
+    const extra = triggers.filter((t) => !isButton(t));
+    if (new Set(buttons.map((t) => t.type)).size > 1) {
+      return {
+        blocked:
+          "It mixes different button actions (like pressed and released), so it can't become one Keypad Builder action. You can still open it in Home Assistant.",
+      };
+    }
+    const type = buttons[0]?.type;
+    const members = [
+      ...new Map(
+        buttons.map((t) => [memberKey(t.device_id, String(t.subtype)), { deviceId: t.device_id, subtype: String(t.subtype) }])
+      ).values(),
+    ];
+    if (members.length === 1 && !extra.length) {
+      const target = autoId(members[0].deviceId, members[0].subtype, type);
+      const existing = members[0].deviceId === s.deviceId ? s.configs[target] : null;
+      if (existing && [].concat(config.conditions ?? config.condition ?? []).length) {
+        return {
+          blocked:
+            "This button already has its own actions in Keypad Builder, and this automation has conditions, so they can't be safely combined. Open both in Home Assistant to merge them by hand.",
+        };
+      }
+      return { kind: "button", type, member: members[0], target, merge: !!existing };
+    }
+    return { kind: "shared", type, members, extra };
+  }
+
+  async _doImport() {
+    const s = this._s;
+    const imp = this._imp;
+    const { related, config } = imp;
+    const { id: _oldId, ...body } = config;
+    imp.busy = true;
+    imp.error = null;
+    this._render();
+    try {
+      // 1. save it as a Keypad Builder automation (name, conditions and settings come along)
+      let newId;
+      if (imp.kind === "button") {
+        newId = imp.target;
+        let out = { ...body };
+        if (imp.merge) {
+          const existing = s.configs[newId];
+          out = {
+            ...existing,
+            actions: [...[].concat(existing.actions ?? existing.action ?? []), ...[].concat(body.actions ?? body.action ?? [])],
+          };
+          delete out.action;
+        }
+        delete out.id;
+        await this._hass.callApi("POST", `config/automation/config/${newId}`, out);
+        s.configs[newId] = { ...out, id: newId };
+        this._trackOurs(newId, s.deviceId, true);
+      } else {
+        newId = `${SHARED_PREFIX}${slug(body.alias || "") || "imported"}_${Math.random().toString(36).slice(2, 6)}`;
+        await this._hass.callApi("POST", `config/automation/config/${newId}`, body);
+        s.shared[newId] = { ...body, id: newId };
+        this._trackOurs(newId, null, true);
+      }
+
+      // 2. the original would still fire too, so remove it or switch it off
+      if (imp.mode === "move") await this._hass.callApi("DELETE", `config/automation/config/${related.id}`);
+      else await this._hass.callService("automation", "turn_off", { entity_id: related.entity_id });
+      s.related = s.related.filter((r) => r.id !== related.id);
+
+      this._imp = null;
+      s.dirty = false; // already confirmed when the import window opened
+      const done = `Imported “${related.name}” ✨${imp.mode === "copy" ? " The original is turned off." : ""}`;
+      if (imp.kind === "button") {
+        this._selectButton(imp.member.subtype, imp.type);
+      } else {
+        this._openShared(newId);
+      }
+      s.msg = { type: "ok", text: done };
+      this._render();
+    } catch (e) {
+      imp.busy = false;
+      imp.error = `Import failed: ${e.body?.message || e.message || e}`;
+      this._render();
+    }
+  }
+
+  _renderImport() {
+    const imp = this._imp;
+    if (!imp) return "";
+    let body;
+    if (imp.loading) {
+      body = `<p class="muted center">Reading the automation…</p>`;
+    } else if (imp.blocked) {
+      body = `<p>${esc(imp.blocked)}</p>`;
+    } else {
+      const what = typeLabel(imp.type).replace(/^When /, "");
+      const n = imp.members?.length || 1;
+      const summary =
+        imp.kind === "button"
+          ? imp.merge
+            ? `This button already has “${what}” actions here, so the imported actions get added after them.`
+            : `It becomes this button's “${what}” actions in Keypad Builder. Its name, conditions and settings come along too.`
+          : `It's used by ${n} button${n === 1 ? "" : "s"}${imp.extra.length ? " plus other triggers" : ""}, so it becomes a 🔗 shared action. Its name, conditions and settings come along too.`;
+      body = `
+        <p>${esc(summary)}</p>
+        <div class="choices">
+          <label class="choice">
+            <input type="radio" name="imp-mode" value="move" ${imp.mode === "move" ? "checked" : ""}>
+            <span><b>Move it</b> <span class="chip">recommended</span><br><span class="muted">Removes the original so nothing runs twice</span></span>
+          </label>
+          <label class="choice">
+            <input type="radio" name="imp-mode" value="copy" ${imp.mode === "copy" ? "checked" : ""}>
+            <span><b>Copy it</b><br><span class="muted">Keeps the original, but turns it off</span></span>
+          </label>
+        </div>
+        <p class="muted">If a script or dashboard points to the old automation, you might need to update it.</p>`;
+    }
+    const canImport = !imp.loading && !imp.blocked;
+    return `
+      <div class="picker-backdrop" data-act="imp-close"></div>
+      <div class="picker" id="import-dialog" role="dialog" aria-label="Import automation" tabindex="-1">
+        <div class="picker-head">
+          <h3>📥 Import “${esc(imp.related.name)}”</h3>
+          <button class="icon" data-act="imp-close" title="Close">✕</button>
+        </div>
+        ${body}
+        ${imp.error ? `<div class="msg error">${esc(imp.error)}</div>` : ""}
+        <div class="picker-foot">
+          ${imp.blocked && imp.related.id ? `<button class="ghost" data-act="open-editor" data-id="${esc(imp.related.id)}">Open in HA ↗</button>` : ""}
+          <span class="spacer"></span>
+          <button class="ghost" data-act="imp-close">Cancel</button>
+          ${canImport ? `<button class="primary" data-act="imp-go" ${imp.busy ? "disabled" : ""}>${imp.busy ? "Importing…" : "Import"}</button>` : ""}
+        </div>
+      </div>`;
+  }
+
   // ---------- button picker (for shared actions) ----------
 
   async _openButtonPicker() {
@@ -1165,7 +1322,15 @@ class KeypadBuilderPanel extends HTMLElement {
           return this._closePicker();
         case "pick-choose":
           return this._choose(el.dataset.entity);
+        case "imp-open":
+          return this._openImport(el.dataset.id);
+        case "imp-close":
+          this._imp = null;
+          return this._render();
+        case "imp-go":
+          return this._doImport();
         case "open-editor":
+          this._imp = null;
           return this._navigate(`/config/automation/edit/${encodeURIComponent(el.dataset.id)}`);
         case "led-save":
           return this._saveLed();
@@ -1203,6 +1368,10 @@ class KeypadBuilderPanel extends HTMLElement {
       if (ev.key !== "Escape") return;
       if (this._picker) this._closePicker();
       else if (this._bp) this._closeButtonPicker(false);
+      else if (this._imp && !this._imp.busy) {
+        this._imp = null;
+        this._render();
+      }
     });
 
     root.addEventListener("input", (ev) => {
@@ -1254,6 +1423,10 @@ class KeypadBuilderPanel extends HTMLElement {
     root.addEventListener("change", (ev) => {
       const el = ev.target;
       const s = this._s;
+      if (el.name === "imp-mode") {
+        this._imp.mode = el.value;
+        return;
+      }
       if (el.dataset.sfield === "type") {
         s.sharedDraft.type = el.value;
         s.dirty = true;
@@ -1355,10 +1528,13 @@ class KeypadBuilderPanel extends HTMLElement {
       ${this._renderDatalists()}
       ${this._renderPicker()}
       ${this._renderButtonPicker()}
+      ${this._renderImport()}
     `;
     this._renderDeviceList();
     this._renderPickerList();
     this._renderButtonPickerList();
+    // focus the import window so Esc reaches us (it has no text box to focus)
+    if (this._imp) this.shadowRoot.querySelector("#import-dialog")?.focus();
     this._syncMenu();
     this._updateLeds();
   }
@@ -1768,7 +1944,7 @@ class KeypadBuilderPanel extends HTMLElement {
     return `
       <div class="section">
         <h3>🔗 Other automations using this button</h3>
-        <div class="muted">Made outside Keypad Builder. They run too when the button is used.</div>
+        <div class="muted">Made outside Keypad Builder. They run too when the button is used. Import one to manage it here.</div>
         ${list
           .map((r) => {
             const types = [...new Set(r.triggers.filter((t) => String(t.subtype) === button.key).map((t) => typeLabel(t.type).replace("When ", "")))];
@@ -1776,7 +1952,10 @@ class KeypadBuilderPanel extends HTMLElement {
               <div><div>${esc(r.name)}</div><div class="muted">${esc(types.join(", "))}</div></div>
               ${
                 r.id
-                  ? `<button class="link" data-act="open-editor" data-id="${esc(r.id)}">Open ↗</button>`
+                  ? `<span class="related-actions">
+                      <button class="link" data-act="imp-open" data-id="${esc(r.id)}">📥 Import</button>
+                      <button class="link" data-act="open-editor" data-id="${esc(r.id)}">Open ↗</button>
+                    </span>`
                   : `<span class="muted" title="Automations written in YAML without an id can't open in the editor">YAML only</span>`
               }
             </div>`;
@@ -2134,6 +2313,16 @@ const STYLES = `
   .pi-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
   .pi-state { font-size: 12px; color: var(--kb-muted); flex: none; }
   .picker-foot { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
+  .picker p { margin: 0; }
+  .picker:focus { outline: none; }
+  .related-actions { display: flex; gap: 14px; flex: none; }
+  .choices { display: flex; flex-direction: column; gap: 8px; }
+  .choice {
+    display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; cursor: pointer;
+    border: 1px solid var(--kb-border); border-radius: 12px;
+  }
+  .choice:has(input:checked) { border-color: var(--kb-accent); background: color-mix(in srgb, var(--kb-accent) 10%, transparent); }
+  .choice input { margin-top: 3px; }
   .chip.on { background: color-mix(in srgb, var(--kb-on) 22%, transparent); }
   .sort { margin-bottom: 8px; }
   .sort label { min-width: 0; }
