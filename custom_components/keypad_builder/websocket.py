@@ -38,6 +38,7 @@ LAYOUT_SCHEMA = vol.Schema(
         vol.Optional("labels", default={}): {str: str},
         vol.Optional("hidden", default=[]): [str],
         vol.Optional("finish", default="auto"): str,
+        vol.Optional("style", default="auto"): str,
     },
     extra=vol.REMOVE_EXTRA,
 )

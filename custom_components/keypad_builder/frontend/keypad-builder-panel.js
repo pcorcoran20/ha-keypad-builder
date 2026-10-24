@@ -111,8 +111,30 @@ function autoLayout(buttons, finish = "auto") {
       rows.push([b.key]);
     }
   }
-  return { rows, labels: {}, hidden: [], finish };
+  return { rows, labels: {}, hidden: [], finish, style: "auto" };
 }
+
+// Device triggers (+ the processor's button info) -> the keypad's buttons, in physical order.
+function buildButtons(triggers, info) {
+  const groups = new Map();
+  for (const t of triggers) {
+    const key = String(t.subtype);
+    if (!groups.has(key)) groups.set(key, { key, subtype: t.subtype, label: pretty(t.subtype), triggers: {} });
+    groups.get(key).triggers[t.type] = t;
+  }
+  const order = new Map((info?.buttons || []).map((b, i) => [String(b.subtype), { ...b, index: i }]));
+  return [...groups.values()]
+    .map((b, i) => ({
+      ...b,
+      number: order.get(b.key)?.number,
+      led: !!order.get(b.key)?.led,
+      ledEntity: order.get(b.key)?.led_entity_id || null,
+      index: order.get(b.key)?.index ?? 1000 + i,
+    }))
+    .sort((a, b) => a.index - b.index);
+}
+
+const KEYPAD_STYLES = { sunnata: "Sunnata", seetouch: "seeTouch", pico: "Pico", classic: "Classic" };
 
 // Make a saved layout fit the buttons the keypad has now.
 function reconcileLayout(saved, buttons) {
@@ -124,10 +146,23 @@ function reconcileLayout(saved, buttons) {
   for (const b of buttons) if (!seen.has(b.key)) rows.push([b.key]);
   const labels = Object.fromEntries(Object.entries(saved.labels || {}).filter(([k, v]) => keys.has(k) && v));
   const hidden = (saved.hidden || []).filter((k) => keys.has(k));
-  return { rows, labels, hidden, finish: saved.finish || "auto" };
+  return { rows, labels, hidden, finish: saved.finish || "auto", style: saved.style || "auto" };
 }
 
 const cloneLayout = (l) => JSON.parse(JSON.stringify(l));
+
+// Drag and drop: put `key` beside another button ({ key, after }) or on a new row ({ newRowAt }).
+function moveButton(layout, key, target) {
+  const rows = layout.rows.map((row) => row.filter((k) => k !== key));
+  if (target.newRowAt != null) {
+    rows.splice(target.newRowAt, 0, [key]);
+  } else {
+    const r = rows.findIndex((row) => row.includes(target.key));
+    if (r < 0) return;
+    rows[r].splice(rows[r].indexOf(target.key) + (target.after ? 1 : 0), 0, key);
+  }
+  layout.rows = rows.filter((row) => row.length);
+}
 
 const TYPE_LABELS = {
   light: "💡 Lights",
@@ -146,6 +181,7 @@ const TYPE_LABELS = {
   binary_sensor: "🚪 Binary sensors",
 };
 const domainLabel = (domain) => TYPE_LABELS[domain] || pretty(domain);
+const domainIcon = (domain) => TYPE_LABELS[domain]?.split(" ")[0] || "🔹";
 
 const LUTRON_TYPES = {
   SunnataKeypad: "Sunnata keypad",
@@ -165,7 +201,9 @@ function friendlyModel(model) {
   let type = LUTRON_TYPES[raw];
   if (!type && /^Pico/.test(raw)) type = "Pico remote";
   if (!type && raw) type = raw.replace(/([a-z])([A-Z])/g, "$1 $2");
-  return { type: type || "", code };
+  // which faceplate look "Auto" picks
+  const family = /^Sunnata/i.test(raw) ? "sunnata" : /^SeeTouch/i.test(raw) ? "seetouch" : /Pico/i.test(raw) ? "pico" : "classic";
+  return { type: type || "", code, family };
 }
 
 // Lutron names devices "<Room> <Location> Position <n> <Kind>". The room is already the
@@ -220,7 +258,7 @@ function parseAction(action) {
   let entities = action.target?.entity_id ?? action.entity_id ?? data.entity_id;
   delete data.entity_id;
   if (typeof entities === "string") entities = entities.split(",").map((e) => e.trim());
-  entities = entities?.length ? entities : [""];
+  entities = [].concat(entities || []).filter(Boolean);
 
   const preset = presetFor(service);
   if (preset) {
@@ -234,12 +272,12 @@ function parseAction(action) {
       delete extra.transition;
     }
     if (Object.keys(extra).length === 0) {
-      return entities.map((entity) => ({ kind: "service", service, entity, brightness, transition }));
+      return [{ kind: "service", service, entities, brightness, transition }];
     }
   }
 
   const dataText = Object.keys(data).length ? JSON.stringify(data, null, 2) : "";
-  return entities.map((entity) => ({ kind: "custom", service, entity, dataText }));
+  return [{ kind: "custom", service, entities, dataText }];
 }
 
 // Turn an editor row back into an automation action. Throws a friendly message on bad input.
@@ -260,12 +298,12 @@ function buildAction(row, index) {
 
   const service = (row.service || "").trim();
   if (!/^[a-z0-9_]+\.[a-z0-9_]+$/.test(service)) throw new Error(`Action ${n}: pick an action like light.turn_on.`);
-  const entity = (row.entity || "").trim();
+  const entities = (row.entities || []).map((e) => e.trim()).filter(Boolean);
   const out = { action: service };
-  if (entity) out.target = { entity_id: entity };
+  if (entities.length) out.target = { entity_id: entities.length === 1 ? entities[0] : entities };
 
   if (row.kind === "service") {
-    if (!entity) throw new Error(`Action ${n}: pick a device/entity for "${presetFor(service)?.label || service}".`);
+    if (!entities.length) throw new Error(`Action ${n}: pick a device/entity for "${presetFor(service)?.label || service}".`);
     if (presetFor(service)?.brightness) {
       const data = {};
       if (row.brightness !== null && row.brightness !== "") data.brightness_pct = Number(row.brightness);
@@ -299,8 +337,8 @@ function parseLed(config) {
 
 function newRow(kind) {
   if (kind === "delay") return { kind: "delay", seconds: 1 };
-  if (kind === "custom") return { kind: "custom", service: "", entity: "", dataText: "" };
-  return { kind: "service", service: kind, entity: "", brightness: presetFor(kind)?.brightness ? 100 : null, transition: null };
+  if (kind === "custom") return { kind: "custom", service: "", entities: [], dataText: "" };
+  return { kind: "service", service: kind, entities: [], brightness: presetFor(kind)?.brightness ? 100 : null, transition: null };
 }
 
 class KeypadBuilderPanel extends HTMLElement {
@@ -308,6 +346,7 @@ class KeypadBuilderPanel extends HTMLElement {
     super();
     this.attachShadow({ mode: "open" });
     this._triggerCache = new Map();
+    this._infoCache = new Map();
     this._themeMode = loadThemeMode();
     this._s = {
       view: "keypad",
@@ -427,6 +466,24 @@ class KeypadBuilderPanel extends HTMLElement {
     return this._triggerCache.get(deviceId);
   }
 
+  async _info(deviceId) {
+    if (!this._infoCache.has(deviceId)) {
+      const info = await this._hass.callWS({ type: "keypad_builder/lutron_info", device_id: deviceId }).catch(() => null);
+      this._infoCache.set(deviceId, info);
+    }
+    return this._infoCache.get(deviceId);
+  }
+
+  // Buttons + layout for any keypad (used to draw the other keypads in a gang).
+  _deviceModel(deviceId) {
+    const buttons = buildButtons(this._triggerCache.get(deviceId) || [], this._infoCache.get(deviceId));
+    return { buttons, layout: reconcileLayout(this._s.layouts[deviceId] || autoLayout(buttons), buttons) };
+  }
+
+  _styleFor(device, layout) {
+    return layout?.style && layout.style !== "auto" ? layout.style : device?.family || "classic";
+  }
+
   async _loadDevices() {
     const s = this._s;
     s.loading = true;
@@ -491,6 +548,13 @@ class KeypadBuilderPanel extends HTMLElement {
       const seen = {};
       for (const d of list) seen[`${d.area}|${d.title}`] = (seen[`${d.area}|${d.title}`] || 0) + 1;
       for (const d of list) d.showPosition = d.position != null && seen[`${d.area}|${d.title}`] > 1;
+      // Lutron's "Position 1/2/3" devices with the same name share a wallbox: show them as one gang
+      const gangs = {};
+      for (const d of list) if (d.showPosition) (gangs[`${d.area}|${d.title}`] ||= []).push(d);
+      for (const members of Object.values(gangs)) {
+        const ids = members.sort((a, b) => a.position - b.position).map((d) => d.id);
+        for (const d of members) d.gang = ids;
+      }
       s.devices = list;
     } catch (e) {
       s.msg = { type: "error", text: `Couldn't load devices: ${e.message || e}` };
@@ -527,29 +591,17 @@ class KeypadBuilderPanel extends HTMLElement {
     this._render();
 
     try {
+      const gang = s.devices.find((d) => d.id === deviceId)?.gang || [deviceId];
       const [triggers, info] = await Promise.all([
         this._triggers(deviceId),
-        this._hass.callWS({ type: "keypad_builder/lutron_info", device_id: deviceId }).catch(() => null),
+        this._info(deviceId),
+        // the other keypads in the same wallbox get drawn too
+        ...gang.filter((id) => id !== deviceId).map((id) => Promise.all([this._triggers(id).catch(() => []), this._info(id)])),
       ]);
-      const groups = new Map();
-      for (const t of triggers) {
-        const key = String(t.subtype);
-        if (!groups.has(key)) groups.set(key, { key, subtype: t.subtype, label: pretty(t.subtype), triggers: {} });
-        groups.get(key).triggers[t.type] = t;
-      }
 
       // Use the processor's button order (and LED info) when the Lutron integration has it.
       s.info = info;
-      const order = new Map((info?.buttons || []).map((b, i) => [String(b.subtype), { ...b, index: i }]));
-      s.buttons = [...groups.values()]
-        .map((b, i) => ({
-          ...b,
-          number: order.get(b.key)?.number,
-          led: !!order.get(b.key)?.led,
-          ledEntity: order.get(b.key)?.led_entity_id || null,
-          index: order.get(b.key)?.index ?? 1000 + i,
-        }))
-        .sort((a, b) => a.index - b.index);
+      s.buttons = buildButtons(triggers, info);
       s.layout = reconcileLayout(s.layouts[deviceId] || autoLayout(s.buttons), s.buttons);
 
       const load = async (id, into) => {
@@ -591,6 +643,31 @@ class KeypadBuilderPanel extends HTMLElement {
     s.dirty = false;
     s.msg = null;
     this._render();
+  }
+
+  // Where a drag would land: an action step (above/below) or a keypad button (left/right) / gap between rows.
+  _dropTarget(ev) {
+    const drag = this._drag;
+    if (drag.kind === "row") {
+      const rowEl = ev.target.closest?.(".rows .row");
+      if (!rowEl) return null;
+      const rect = rowEl.getBoundingClientRect();
+      const after = ev.clientY > rect.top + rect.height / 2;
+      return { el: rowEl, mark: after ? "drop-after" : "drop-before", index: Number(rowEl.dataset.rowIndex), after };
+    }
+    const zone = ev.target.closest?.(".faceplate.current .drop-row");
+    if (zone) return { el: zone, mark: "drop-on", newRowAt: Number(zone.dataset.dropRow) };
+    const btn = ev.target.closest?.(".faceplate.current .kbtn");
+    if (!btn || btn.dataset.key === drag.key) return null;
+    const rect = btn.getBoundingClientRect();
+    const after = ev.clientX > rect.left + rect.width / 2;
+    return { el: btn, mark: after ? "drop-right" : "drop-left", key: btn.dataset.key, after };
+  }
+
+  _clearDropMarks() {
+    for (const el of this.shadowRoot.querySelectorAll(".drop-before, .drop-after, .drop-on, .drop-left, .drop-right")) {
+      el.classList.remove("drop-before", "drop-after", "drop-on", "drop-left", "drop-right");
+    }
   }
 
   _okToLeave() {
@@ -1248,9 +1325,16 @@ class KeypadBuilderPanel extends HTMLElement {
       const s = this._s;
       const i = Number(el.dataset.row);
       switch (el.dataset.act) {
+        case "device-plate":
+          return s.editingLayout ? undefined : this._selectDevice(el.dataset.id);
         case "device":
           return this._selectDevice(el.dataset.id);
         case "button":
+          if (el.dataset.device && el.dataset.device !== s.deviceId) {
+            if (s.editingLayout) return;
+            const target = el.dataset.device;
+            return this._selectDevice(target).then(() => s.deviceId === target && this._selectButton(el.dataset.key));
+          }
           if (s.editingLayout) {
             return root.querySelector(`input[data-lkey="${CSS.escape(el.dataset.key)}"]`)?.focus();
           }
@@ -1313,6 +1397,7 @@ class KeypadBuilderPanel extends HTMLElement {
         }
         case "reload":
           this._triggerCache.clear();
+          this._infoCache.clear();
           return this._loadDevices();
         case "theme":
           return this._cycleTheme();
@@ -1322,6 +1407,14 @@ class KeypadBuilderPanel extends HTMLElement {
           return this._closePicker();
         case "pick-choose":
           return this._choose(el.dataset.entity);
+        case "pick-done":
+          return this._applyPicker(this._picker.selected);
+        case "pick-room":
+          return this._toggleRoom(el.dataset.area);
+        case "pick-type":
+          this._picker.type = el.dataset.type;
+          for (const chip of root.querySelectorAll(".tchip")) chip.classList.toggle("on", chip.dataset.type === el.dataset.type);
+          return this._renderPickerList();
         case "imp-open":
           return this._openImport(el.dataset.id);
         case "imp-close":
@@ -1364,6 +1457,60 @@ class KeypadBuilderPanel extends HTMLElement {
       }
     });
 
+    root.addEventListener("dragstart", (ev) => {
+      const handle = ev.target.closest?.("[data-drag-row]");
+      if (handle) {
+        const rowEl = handle.closest(".row");
+        this._drag = { kind: "row", index: Number(handle.dataset.dragRow) };
+        ev.dataTransfer.setDragImage(rowEl, 24, 24);
+        rowEl.classList.add("dragging");
+      } else {
+        const btn = ev.target.closest?.(".faceplate.current .kbtn");
+        if (!btn || !this._s.editingLayout) return;
+        this._drag = { kind: "button", key: btn.dataset.key };
+        btn.classList.add("dragging");
+      }
+      ev.dataTransfer.effectAllowed = "move";
+      ev.dataTransfer.setData("text/plain", "keypad-builder");
+    });
+
+    root.addEventListener("dragover", (ev) => {
+      if (!this._drag) return;
+      const target = this._dropTarget(ev);
+      this._clearDropMarks();
+      if (!target) return;
+      ev.preventDefault();
+      ev.dataTransfer.dropEffect = "move";
+      target.el.classList.add(target.mark);
+    });
+
+    root.addEventListener("drop", (ev) => {
+      const drag = this._drag;
+      const target = drag && this._dropTarget(ev);
+      this._clearDropMarks();
+      if (!target) return;
+      ev.preventDefault();
+      this._drag = null;
+      const s = this._s;
+      if (drag.kind === "row") {
+        let to = target.index + (target.after ? 1 : 0);
+        if (drag.index < to) to--;
+        if (to === drag.index) return this._render();
+        const [moved] = s.rows.splice(drag.index, 1);
+        s.rows.splice(to, 0, moved);
+        s.dirty = true;
+        s.msg = null;
+        return this._render();
+      }
+      this._changeLayout((d) => moveButton(d, drag.key, target));
+    });
+
+    root.addEventListener("dragend", () => {
+      this._drag = null;
+      this._clearDropMarks();
+      for (const el of root.querySelectorAll(".dragging")) el.classList.remove("dragging");
+    });
+
     root.addEventListener("keydown", (ev) => {
       if (ev.key !== "Escape") return;
       if (this._picker) this._closePicker();
@@ -1404,8 +1551,8 @@ class KeypadBuilderPanel extends HTMLElement {
         const value = el.value.trim();
         if (value) s.layoutDraft.labels[key] = value;
         else delete s.layoutDraft.labels[key];
-        const label = root.querySelector(`.kbtn[data-key="${CSS.escape(key)}"] .label`);
-        if (label) label.textContent = this._layoutLabel(key);
+        const btn = root.querySelector(`.faceplate.current .kbtn[data-key="${CSS.escape(key)}"]`);
+        if (btn && !btn.classList.contains("arrow")) btn.querySelector(".label").textContent = this._layoutLabel(key);
         return;
       }
       if (el.dataset.field == null) return;
@@ -1442,8 +1589,8 @@ class KeypadBuilderPanel extends HTMLElement {
         }
         return this._renderDeviceList();
       }
-      if (el.id === "pick-area" || el.id === "pick-type") {
-        this._picker[el.id === "pick-area" ? "area" : "type"] = el.value;
+      if (el.id === "pick-area") {
+        this._picker.area = el.value;
         return this._renderPickerList();
       }
       if (el.id === "all-devices") {
@@ -1461,16 +1608,18 @@ class KeypadBuilderPanel extends HTMLElement {
           d.hidden = el.checked ? [...d.hidden, key] : d.hidden.filter((k) => k !== key);
         });
       }
-      if (el.dataset.lfield === "finish") {
-        return this._changeLayout((d) => (d.finish = el.value));
+      if (el.dataset.lfield) {
+        return this._changeLayout((d) => (d[el.dataset.lfield] = el.value));
       }
       if (el.dataset.kind != null) {
         const i = Number(el.dataset.kind);
         const old = s.rows[i];
         const row = newRow(el.value);
         // keep the chosen entity when switching between similar actions
-        if (presetFor(el.value)?.led) row.entity = (s.view === "keypad" && this._current()?.button.ledEntity) || "";
-        else if ("entity" in row && old.entity) row.entity = old.entity;
+        if (presetFor(el.value)?.led) {
+          const led = s.view === "keypad" && this._current()?.button.ledEntity;
+          row.entities = led ? [led] : [];
+        } else if ("entities" in row && old.entities?.length) row.entities = [...old.entities];
         s.rows[i] = row;
         s.dirty = true;
         s.msg = null;
@@ -1593,28 +1742,12 @@ class KeypadBuilderPanel extends HTMLElement {
     const editing = s.editingLayout;
     const layout = editing ? s.layoutDraft : s.layout;
     const byKey = new Map(s.buttons.map((b) => [b.key, b]));
+    const members = (device.gang || [device.id]).map((id) => s.devices.find((d) => d.id === id)).filter(Boolean);
 
-    const btn = (b, small) => {
-      const has = Object.keys(b.triggers).some((t) => s.configs[autoId(s.deviceId, b.subtype, t)]);
-      const inShared = !has && this._sharedFor(s.deviceId, b.key).length > 0;
-      const other = !has && !inShared && this._relatedFor(b).length > 0;
-      const hidden = layout.hidden.includes(b.key);
-      const label = this._layoutLabel(b.key, layout);
-      const cls = ["kbtn", small && "small", b.key === s.sel && !editing && "active", has && "has", inShared && "has-shared", other && "has-other", hidden && "is-hidden", b.led && "with-led"];
-      return `<button class="${cls.filter(Boolean).join(" ")}" data-act="button" data-key="${esc(b.key)}" title="${esc(label)}">
-        ${b.led ? `<span class="led" ${b.ledEntity ? `data-led-entity="${esc(b.ledEntity)}"` : ""}></span>` : ""}<span class="label">${esc(label)}</span><span class="dot"></span>
-      </button>`;
-    };
-
-    const rows = layout.rows
-      .map((row) => row.map((k) => byKey.get(k)).filter((b) => b && (editing || !layout.hidden.includes(b.key))))
-      .filter((row) => row.length)
-      .map((row) => (row.length > 1 ? `<div class="pair">${row.map((b) => btn(b, true)).join("")}</div>` : btn(row[0])))
-      .join("");
-
-    const source = s.info
-      ? `<div class="source">📡 Button order &amp; names from your Lutron processor</div>`
-      : "";
+    const notes = [
+      s.info && "📡 Button order &amp; names from your Lutron processor",
+      members.length > 1 && `🔲 ${members.length}-gang box: tap any keypad in it`,
+    ].filter(Boolean);
 
     return `
       <div class="card-head">
@@ -1624,8 +1757,12 @@ class KeypadBuilderPanel extends HTMLElement {
         </div>
         ${editing ? "" : `<button class="ghost" data-act="l-edit">✏️ Edit layout</button>`}
       </div>
-      ${source}
-      <div class="faceplate finish-${esc(layout.finish)}">${rows}</div>
+      ${notes.map((n) => `<div class="source">${n}</div>`).join("")}
+      <div class="wallplate-wrap">
+        <div class="wallplate finish-${esc(layout.finish)} ${members.length > 1 ? "ganged" : ""}">
+          ${members.map((d) => this._renderFaceplate(d, members.length > 1)).join("")}
+        </div>
+      </div>
       ${
         editing
           ? this._renderLayoutEditor(layout, byKey)
@@ -1638,12 +1775,70 @@ class KeypadBuilderPanel extends HTMLElement {
     `;
   }
 
+  // One keypad's faceplate, drawn in its style. Other keypads in a gang are clickable too.
+  _renderFaceplate(device, ganged) {
+    const s = this._s;
+    const current = device.id === s.deviceId;
+    const editing = current && s.editingLayout;
+    const { buttons, layout } = current
+      ? { buttons: s.buttons, layout: editing ? s.layoutDraft : s.layout }
+      : this._deviceModel(device.id);
+    const style = this._styleFor(device, layout);
+    const ours = new Set(s.ours.map((a) => a.id));
+    const byKey = new Map(buttons.map((b) => [b.key, b]));
+
+    const btn = (b, small) => {
+      const has = Object.keys(b.triggers).some((t) => ours.has(autoId(device.id, b.subtype, t)));
+      const inShared = !has && this._sharedFor(device.id, b.key).length > 0;
+      const other = current && !has && !inShared && this._relatedFor(b).length > 0;
+      const hidden = layout.hidden.includes(b.key);
+      const label = layout.labels[b.key] || b.label;
+      // real keypads print arrows on raise/lower
+      const arrow = style !== "classic" && (isRaise(b.label) ? "▲" : isLower(b.label) ? "▼" : "");
+      const cls = [
+        "kbtn",
+        small && "small",
+        arrow && "arrow",
+        current && b.key === s.sel && !editing && "active",
+        has && "has",
+        inShared && "has-shared",
+        other && "has-other",
+        hidden && "is-hidden",
+        b.led && "with-led",
+      ];
+      return `<button class="${cls.filter(Boolean).join(" ")}" data-act="button" data-key="${esc(b.key)}" data-device="${esc(device.id)}" title="${esc(label)}" ${editing ? `draggable="true"` : ""}>
+        ${b.led ? `<span class="led" ${b.ledEntity ? `data-led-entity="${esc(b.ledEntity)}"` : ""}></span>` : ""}<span class="label">${esc(arrow || label)}</span><span class="dot"></span>
+      </button>`;
+    };
+
+    const rows = layout.rows
+      .map((row) => row.map((k) => byKey.get(k)).filter((b) => b && (editing || !layout.hidden.includes(b.key))))
+      .filter((row) => row.length);
+    const paddle = style === "pico" && rows.length === 2 && rows.every((r) => r.length === 1);
+    const rowHtml = (row) => (row.length > 1 ? `<div class="pair">${row.map((b) => btn(b, true)).join("")}</div>` : btn(row[0]));
+    // while editing, thin drop zones between rows make a new row when you drop a button there
+    const zone = (i) => `<div class="drop-row" data-drop-row="${i}"></div>`;
+    const body = !rows.length
+      ? `<div class="fp-empty">No buttons</div>`
+      : editing
+        ? rows.map((row, i) => zone(i) + rowHtml(row)).join("") + zone(rows.length)
+        : rows.map(rowHtml).join("");
+
+    return `<div class="faceplate style-${style} ${paddle ? "paddle" : ""} ${current ? "current" : "sibling"} ${editing ? "editing" : ""}" ${
+      current ? "" : `data-act="device-plate" data-id="${esc(device.id)}" title="${esc(device.name)}"`
+    }>${body}${ganged && device.position != null ? `<span class="fp-pos">${device.position}</span>` : ""}</div>`;
+  }
+
   _renderLayoutEditor(layout, byKey) {
     const s = this._s;
     const finishOptions = FINISHES.map(
       ([v, l]) => `<option value="${v}" ${v === layout.finish ? "selected" : ""}>${esc(l)}</option>`
     ).join("");
     const last = layout.rows.length - 1;
+    const family = s.devices.find((d) => d.id === s.deviceId)?.family || "classic";
+    const styleOptions = [["auto", `Auto (${KEYPAD_STYLES[family]})`], ...Object.entries(KEYPAD_STYLES)]
+      .map(([v, l]) => `<option value="${v}" ${v === (layout.style || "auto") ? "selected" : ""}>${esc(l)}</option>`)
+      .join("");
 
     const rows = layout.rows
       .map(
@@ -1672,8 +1867,9 @@ class KeypadBuilderPanel extends HTMLElement {
 
     return `
       <div class="layout-editor">
+        <div class="inline"><label>Style</label><select data-lfield="style">${styleOptions}</select></div>
         <div class="inline"><label>Finish</label><select data-lfield="finish">${finishOptions}</select></div>
-        <p class="muted">Rename buttons, move rows, or join rows so buttons sit side by side. Names here are just for this page, your automations don't change.</p>
+        <p class="muted">✋ <b>Drag buttons on the keypad</b> to move them: drop on another button to sit side by side, or between rows for a new row. Rename or hide them below. Names here are just for this page, your automations don't change.</p>
         ${rows}
         ${s.layoutMsg ? `<div class="msg error">${esc(s.layoutMsg)}</div>` : ""}
         <div class="footer">
@@ -1908,7 +2104,7 @@ class KeypadBuilderPanel extends HTMLElement {
     let body = "";
     if (led.mode === "follow") {
       body = `
-        ${this._entityButton(led.entity, "led", "Choose what the LED follows…")}
+        ${this._entityButton([led.entity], "led", "Choose what the LED follows…")}
         <div class="inline"><label>LED on when</label>
           <input placeholder="on" value="${esc(led.state)}" data-led-field="state">
         </div>
@@ -1979,7 +2175,7 @@ class KeypadBuilderPanel extends HTMLElement {
     if (row.kind === "service") {
       const preset = presetFor(row.service);
       body = `
-        ${this._entityButton(row.entity, `row-${i}`, preset.led ? "Choose a keypad LED…" : "Choose what to control…")}
+        ${this._entityButton(row.entities, `row-${i}`, preset.led ? "Choose a keypad LED…" : "Choose what to control…")}
         ${
           preset.brightness
             ? `<div class="inline">
@@ -1996,7 +2192,7 @@ class KeypadBuilderPanel extends HTMLElement {
     } else if (row.kind === "custom") {
       body = `
         <input class="grow" list="dl-services" placeholder="action, e.g. light.turn_on" value="${esc(row.service)}" data-row="${i}" data-field="service">
-        ${this._entityButton(row.entity, `row-${i}`, "Entity (optional)…")}
+        ${this._entityButton(row.entities, `row-${i}`, "Entity (optional)…")}
         <textarea rows="3" placeholder='extra data as JSON, e.g. {"color_name": "pink"}' data-row="${i}" data-field="dataText">${esc(row.dataText)}</textarea>`;
     } else if (row.kind === "delay") {
       body = `<div class="inline"><label>Seconds</label>
@@ -2007,8 +2203,9 @@ class KeypadBuilderPanel extends HTMLElement {
     }
 
     return `
-      <div class="row">
+      <div class="row" data-row-index="${i}">
         <div class="row-head">
+          <span class="drag-handle" draggable="true" data-drag-row="${i}" title="Drag to reorder">⠿</span>
           <span class="num">${i + 1}</span>
           <select data-kind="${i}">${options}</select>
           <button class="icon" data-act="up" data-row="${i}" title="Move up">↑</button>
@@ -2032,14 +2229,26 @@ class KeypadBuilderPanel extends HTMLElement {
     return this._areaName?.[this._entityArea?.[entityId]] || "";
   }
 
-  _entityButton(value, pickId, placeholder) {
-    const st = this._hass.states[value];
-    const meta = [this._areaOf(value), value].filter(Boolean).join(" · ") + (value && !st ? " · ⚠️ not found" : "");
-    return `<button class="entity-field ${value ? "" : "empty"}" data-act="pick" data-pick="${esc(pickId)}">
-      <span class="ef-text">
-        <span class="ef-name">${esc(value ? st?.attributes.friendly_name || value : placeholder)}</span>
-        ${value ? `<span class="ef-meta">${esc(meta)}</span>` : ""}
-      </span>
+  _entityButton(values, pickId, placeholder) {
+    const list = [].concat(values || []).filter(Boolean);
+    const name = (id) => this._hass.states[id]?.attributes.friendly_name || id;
+    let inner;
+    if (!list.length) {
+      inner = `<span class="ef-text"><span class="ef-name">${esc(placeholder)}</span></span>`;
+    } else if (list.length === 1) {
+      const id = list[0];
+      const meta = [this._areaOf(id), id].filter(Boolean).join(" · ") + (this._hass.states[id] ? "" : " · ⚠️ not found");
+      inner = `<span class="ef-icon">${domainIcon(id.split(".")[0])}</span>
+        <span class="ef-text"><span class="ef-name">${esc(name(id))}</span><span class="ef-meta">${esc(meta)}</span></span>`;
+    } else {
+      const SHOW = 4;
+      inner = `<span class="ef-chips">${list
+        .slice(0, SHOW)
+        .map((id) => `<span class="ef-chip" title="${esc(id)}">${domainIcon(id.split(".")[0])} ${esc(name(id))}${this._hass.states[id] ? "" : " ⚠️"}</span>`)
+        .join("")}${list.length > SHOW ? `<span class="ef-chip more">+${list.length - SHOW} more</span>` : ""}</span>`;
+    }
+    return `<button class="entity-field ${list.length ? "" : "empty"}" data-act="pick" data-pick="${esc(pickId)}">
+      ${inner}
       <span class="ef-chev">▾</span>
     </button>`;
   }
@@ -2048,18 +2257,20 @@ class KeypadBuilderPanel extends HTMLElement {
     const s = this._s;
     let domains = null;
     let led = false;
-    let value = "";
+    let values = [];
     if (pickId === "led") {
-      value = s.led?.entity || "";
+      values = s.led?.entity ? [s.led.entity] : [];
     } else {
       const row = s.rows[Number(pickId.slice(4))];
       if (!row) return;
-      value = row.entity || "";
+      values = [...(row.entities || [])];
       const preset = row.kind === "service" ? presetFor(row.service) : null;
       led = !!preset?.led;
       domains = preset && !led ? preset.domains : null;
     }
-    this._picker = { pickId, domains, led, value, q: "", area: "", type: "" };
+    // action steps can control several things at once; the LED follows just one
+    const multi = pickId !== "led";
+    this._picker = { pickId, domains, led, multi, value: values[0] || "", selected: values, q: "", area: "", type: "" };
     this._render();
     this.shadowRoot.querySelector("#pick-q")?.focus();
   }
@@ -2070,17 +2281,40 @@ class KeypadBuilderPanel extends HTMLElement {
   }
 
   _choose(entityId) {
+    const p = this._picker;
+    if (p.multi) {
+      // tiles toggle; Done applies
+      if (!entityId) p.selected = [];
+      else if (p.selected.includes(entityId)) p.selected = p.selected.filter((e) => e !== entityId);
+      else p.selected = [...p.selected, entityId];
+      return this._renderPickerList();
+    }
+    this._applyPicker(entityId ? [entityId] : []);
+  }
+
+  _applyPicker(values) {
     const s = this._s;
     const { pickId } = this._picker;
     if (pickId === "led") {
-      s.led.entity = entityId;
+      s.led.entity = values[0] || "";
       s.ledDirty = true;
     } else {
-      s.rows[Number(pickId.slice(4))].entity = entityId;
+      s.rows[Number(pickId.slice(4))].entities = values;
       s.dirty = true;
       s.msg = null;
     }
     this._closePicker();
+  }
+
+  // "Select all" for one room group: picks everything shown there, or unpicks if all are picked.
+  _toggleRoom(areaKey) {
+    const p = this._picker;
+    const ids = this._pickerItems()
+      .filter((e) => (e.areaId || "__none") === areaKey)
+      .map((e) => e.id);
+    const all = ids.every((id) => p.selected.includes(id));
+    p.selected = all ? p.selected.filter((id) => !ids.includes(id)) : [...p.selected, ...ids.filter((id) => !p.selected.includes(id))];
+    this._renderPickerList();
   }
 
   // Everything this field could pick from, before the room/type/search filters.
@@ -2117,43 +2351,47 @@ class KeypadBuilderPanel extends HTMLElement {
       .sort((a, b) => a[1].localeCompare(b[1]))
       .map(([id, name]) => `<option value="${esc(id)}" ${p.area === id ? "selected" : ""}>${esc(name)}</option>`)
       .join("");
-    const typeOptions = [...types]
+    const typeChips = [...types]
       .sort((a, b) => domainLabel(a).replace(/^\W+/, "").localeCompare(domainLabel(b).replace(/^\W+/, "")))
-      .map((t) => `<option value="${esc(t)}" ${p.type === t ? "selected" : ""}>${esc(domainLabel(t))}</option>`)
+      .map((t) => `<button class="tchip ${p.type === t ? "on" : ""}" data-act="pick-type" data-type="${esc(t)}">${esc(domainLabel(t))}</button>`)
       .join("");
-    const title = p.led ? "Choose a keypad LED" : p.pickId === "led" ? "What should the LED follow?" : "Choose what to control";
+    const title = p.led ? "Choose keypad LEDs" : p.pickId === "led" ? "What should the LED follow?" : "Choose what to control";
 
     return `
       <div class="picker-backdrop" data-act="pick-close"></div>
-      <div class="picker" role="dialog" aria-label="${esc(title)}">
+      <div class="picker wide" role="dialog" aria-label="${esc(title)}">
         <div class="picker-head">
           <h3>${esc(title)}</h3>
           <button class="icon" data-act="pick-close" title="Close">✕</button>
         </div>
-        <input id="pick-q" type="search" placeholder="Search by name…" value="${esc(p.q)}" autocomplete="off">
         <div class="picker-filters">
+          <input id="pick-q" type="search" placeholder="Search by name…" value="${esc(p.q)}" autocomplete="off">
           <select id="pick-area" aria-label="Room">
             <option value="">🏠 All rooms</option>
             ${roomOptions}
             ${noRoom ? `<option value="__none" ${p.area === "__none" ? "selected" : ""}>No room</option>` : ""}
           </select>
-          ${
-            types.size > 1
-              ? `<select id="pick-type" aria-label="Type"><option value="">✨ All types</option>${typeOptions}</select>`
-              : ""
-          }
         </div>
+        ${
+          types.size > 1
+            ? `<div class="type-chips"><button class="tchip ${p.type ? "" : "on"}" data-act="pick-type" data-type="">✨ All types</button>${typeChips}</div>`
+            : ""
+        }
         <div id="pick-list" class="pick-list"></div>
-        ${p.value ? `<div class="picker-foot"><button class="ghost" data-act="pick-choose" data-entity="">Clear selection</button></div>` : ""}
+        <div class="picker-foot">
+          ${p.multi ? `<span class="muted" id="pick-count"></span>` : ""}
+          <span class="spacer"></span>
+          ${p.multi ? `<button class="ghost" data-act="pick-choose" data-entity="">Clear</button>` : p.value ? `<button class="ghost" data-act="pick-choose" data-entity="">Clear selection</button>` : ""}
+          ${p.multi ? `<button class="ghost" data-act="pick-close">Cancel</button><button class="primary" data-act="pick-done">Done</button>` : ""}
+        </div>
       </div>`;
   }
 
-  _renderPickerList() {
+  // What's showing after the room/type/search filters.
+  _pickerItems() {
     const p = this._picker;
-    const box = this.shadowRoot.querySelector("#pick-list");
-    if (!p || !box) return;
     const words = p.q.toLowerCase().split(/\s+/).filter(Boolean);
-    const items = this._pickerCandidates()
+    return this._pickerCandidates()
       .map((st) => ({
         id: st.entity_id,
         name: st.attributes.friendly_name || st.entity_id,
@@ -2169,24 +2407,46 @@ class KeypadBuilderPanel extends HTMLElement {
         return words.every((w) => hay.includes(w));
       })
       .sort((a, b) => (a.area || "~").localeCompare(b.area || "~") || a.name.localeCompare(b.name));
+  }
 
+  _renderPickerList() {
+    const p = this._picker;
+    const box = this.shadowRoot.querySelector("#pick-list");
+    if (!p || !box) return;
+    const count = this.shadowRoot.querySelector("#pick-count");
+    if (count) count.textContent = `${p.selected.length} selected`;
+    const items = this._pickerItems();
     if (!items.length) {
       box.innerHTML = `<p class="muted center">Nothing matches 🥲 Try another room, type or search.</p>`;
       return;
     }
-    const LIMIT = 250;
-    let lastArea = null;
+    const LIMIT = 300;
+    const groups = new Map();
+    for (const e of items.slice(0, LIMIT)) {
+      const key = e.areaId || "__none";
+      if (!groups.has(key)) groups.set(key, { name: e.area || "No room", items: [] });
+      groups.get(key).items.push(e);
+    }
+    const isOn = (id) => (p.multi ? p.selected.includes(id) : id === p.value);
     box.innerHTML =
-      items
-        .slice(0, LIMIT)
-        .map((e) => {
-          const header = e.area !== lastArea ? `<div class="area">${esc(e.area || "No room")}</div>` : "";
-          lastArea = e.area;
-          return `${header}<button class="pick-item ${e.id === p.value ? "active" : ""}" data-act="pick-choose" data-entity="${esc(e.id)}">
-            <span class="pi-text"><span class="pi-name">${esc(e.name)}</span>
-            <span class="pi-meta">${esc(domainLabel(e.domain))} · ${esc(e.id)}</span></span>
-            <span class="pi-state">${esc(e.state)}</span>
-          </button>`;
+      [...groups.entries()]
+        .map(([key, g]) => {
+          const allOn = g.items.every((e) => isOn(e.id));
+          return `<div class="area tile-area">${esc(g.name)}${
+            p.multi && g.items.length > 1
+              ? ` <button class="link small" data-act="pick-room" data-area="${esc(key)}">${allOn ? "Unselect all" : "Select all"}</button>`
+              : ""
+          }</div>
+          <div class="tile-grid">${g.items
+            .map((e) => {
+              const on = isOn(e.id);
+              return `<button class="tile ${on ? "on" : ""}" data-act="pick-choose" data-entity="${esc(e.id)}" aria-pressed="${on}" title="${esc(e.id)}">
+                <span class="tile-top"><span class="tile-icon">${domainIcon(e.domain)}</span><span class="tile-check">${on ? "✓" : ""}</span></span>
+                <span class="tile-name">${esc(e.name)}</span>
+                <span class="tile-state">${esc(e.state)}</span>
+              </button>`;
+            })
+            .join("")}</div>`;
         })
         .join("") +
       (items.length > LIMIT ? `<p class="muted center">Showing ${LIMIT} of ${items.length}. Search or filter to narrow it down.</p>` : "");
@@ -2239,7 +2499,7 @@ const STYLES = `
   .theme { font-size: 18px; color: inherit; }
   .layout {
     display: grid; gap: 16px; padding: 16px;
-    grid-template-columns: minmax(220px, 280px) minmax(260px, 340px) minmax(0, 1fr);
+    grid-template-columns: minmax(220px, 280px) minmax(300px, max-content) minmax(360px, 1fr);
     align-items: start;
   }
   @media (max-width: 1000px) { .layout { grid-template-columns: 1fr 1fr; } .editor { grid-column: 1 / -1; } }
@@ -2288,9 +2548,43 @@ const STYLES = `
   .entity-field:hover { border-color: var(--kb-accent); }
   .entity-field.empty .ef-name { color: var(--kb-muted); }
   .ef-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-  .ef-name, .pi-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ef-meta, .pi-meta { font-size: 12px; color: var(--kb-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ef-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ef-meta { font-size: 12px; color: var(--kb-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .ef-chev { color: var(--kb-muted); }
+  .ef-icon { font-size: 18px; flex: none; }
+  .ef-chips { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+  .ef-chip {
+    font-size: 13px; padding: 3px 9px; border-radius: 999px; max-width: 100%;
+    background: color-mix(in srgb, var(--kb-accent) 14%, transparent);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .ef-chip.more { background: var(--kb-border); }
+  .picker.wide { width: min(780px, calc(100vw - 32px)); }
+  .picker-filters input { flex: 2; min-width: 180px; }
+  .type-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .tchip { border: 1px solid var(--kb-border); background: none; border-radius: 999px; padding: 5px 11px; font-size: 13px; }
+  .tchip:hover { border-color: var(--kb-accent); }
+  .tchip.on { background: var(--kb-accent); border-color: var(--kb-accent); color: var(--kb-on-accent); }
+  .tile-area { display: flex; align-items: center; gap: 10px; }
+  .link.small { font-size: 12px; text-transform: none; letter-spacing: 0; }
+  .tile-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 8px; }
+  .tile {
+    display: flex; flex-direction: column; align-items: flex-start; gap: 4px; text-align: left; min-height: 92px;
+    padding: 10px; border-radius: 12px; border: 1px solid var(--kb-border); background: var(--kb-input);
+    transition: border-color .12s, background .12s, transform .08s;
+  }
+  .tile:hover { border-color: var(--kb-accent); }
+  .tile:active { transform: scale(.98); }
+  .tile.on { border-color: var(--kb-accent); background: color-mix(in srgb, var(--kb-accent) 14%, var(--kb-input)); }
+  .tile-top { display: flex; justify-content: space-between; width: 100%; }
+  .tile-icon { font-size: 22px; }
+  .tile-check {
+    width: 20px; height: 20px; border-radius: 6px; border: 2px solid var(--kb-border);
+    display: grid; place-items: center; font-size: 13px; font-weight: 700; color: var(--kb-on-accent);
+  }
+  .tile.on .tile-check { background: var(--kb-accent); border-color: var(--kb-accent); }
+  .tile-name { font-weight: 500; font-size: 14px; line-height: 1.25; overflow-wrap: anywhere; }
+  .tile-state { font-size: 12px; color: var(--kb-muted); margin-top: auto; }
   .picker-backdrop { position: fixed; inset: 0; background: rgba(0, 0, 0, .45); z-index: 10; }
   .picker {
     position: fixed; z-index: 11; left: 50%; top: 50%; translate: -50% -50%;
@@ -2304,14 +2598,6 @@ const STYLES = `
   .picker-filters select { flex: 1; min-width: 160px; }
   .pick-list { overflow-y: auto; min-height: 120px; display: flex; flex-direction: column; gap: 2px; }
   .pick-list .area { margin-top: 10px; }
-  .pick-item {
-    display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
-    background: none; border: 1px solid transparent; border-radius: 10px; padding: 8px 10px;
-  }
-  .pick-item:hover { background: var(--kb-border); }
-  .pick-item.active { border-color: var(--kb-accent); background: color-mix(in srgb, var(--kb-accent) 12%, transparent); }
-  .pi-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-  .pi-state { font-size: 12px; color: var(--kb-muted); flex: none; }
   .picker-foot { display: flex; align-items: center; justify-content: flex-end; gap: 8px; }
   .picker p { margin: 0; }
   .picker:focus { outline: none; }
@@ -2342,23 +2628,44 @@ const STYLES = `
   .bp-btn.on { background: var(--kb-accent); border-color: var(--kb-accent); color: var(--kb-on-accent); }
   .source { margin-top: 10px; font-size: 12px; color: var(--kb-muted); }
 
-  /* ---- faceplate ---- */
-  .faceplate {
+  /* ---- wallplate + faceplates ---- */
+  .wallplate-wrap { overflow-x: auto; padding: 4px 0 8px; }
+  .wallplate {
     --fp-top: #fdfdfb; --fp-bottom: #ecebe6; --fp-btn-top: #ffffff; --fp-btn-bottom: #f1f0eb;
-    --fp-text: #3a3a3c; --fp-edge: rgba(0,0,0,.14);
-    margin: 16px auto; width: 210px; padding: 28px 22px; border-radius: 18px;
+    --fp-text: #3a3a3c; --fp-edge: rgba(0,0,0,.14); --led-off: color-mix(in srgb, var(--fp-text) 28%, transparent);
+    display: flex; gap: 16px; width: max-content; margin: 14px auto; padding: 18px;
+    border-radius: 12px;
     background: linear-gradient(160deg, var(--fp-top), var(--fp-bottom));
-    box-shadow: 0 1px 0 rgba(255,255,255,.5) inset, 0 8px 24px rgba(0,0,0,.25), 0 0 0 1px rgba(0,0,0,.1);
-    display: flex; flex-direction: column; gap: 10px;
+    box-shadow: 0 1px 0 rgba(255,255,255,.5) inset, 0 12px 30px rgba(0,0,0,.28), 0 0 0 1px rgba(0,0,0,.12);
   }
   .finish-ivory { --fp-top: #fbf7ec; --fp-bottom: #ece4cf; --fp-btn-top: #fdf9ef; --fp-btn-bottom: #efe8d6; --fp-text: #4a4436; }
   .finish-gray { --fp-top: #a9aaa8; --fp-bottom: #8c8d8b; --fp-btn-top: #b3b4b2; --fp-btn-bottom: #999a98; --fp-text: #222; }
   .finish-black, :host([dark]) .finish-auto {
     --fp-top: #2c2c2e; --fp-bottom: #161617; --fp-btn-top: #313133; --fp-btn-bottom: #1f1f21;
-    --fp-text: #d6d6d8; --fp-edge: rgba(255,255,255,.08);
+    --fp-text: #d6d6d8; --fp-edge: rgba(255,255,255,.09);
   }
   .finish-brass { --fp-top: #d9c18a; --fp-bottom: #a88a4c; --fp-btn-top: #e2cc98; --fp-btn-bottom: #b99a5a; --fp-text: #3b2f16; }
   .finish-nickel { --fp-top: #dcdddf; --fp-bottom: #a9abaf; --fp-btn-top: #e5e6e8; --fp-btn-bottom: #b6b8bc; --fp-text: #2e3034; }
+
+  .faceplate {
+    --row-gap: 10px;
+    position: relative; display: flex; flex-direction: column; justify-content: center; gap: var(--row-gap);
+    width: 176px; min-height: 280px; padding: 22px 16px; border-radius: 10px;
+    background: linear-gradient(160deg, var(--fp-top), var(--fp-bottom));
+    box-shadow: 0 0 0 1px var(--fp-edge), 0 1px 3px rgba(0,0,0,.12);
+  }
+  .faceplate.sibling { cursor: pointer; opacity: .78; transition: opacity .15s; }
+  .faceplate.sibling:hover { opacity: 1; }
+  .wallplate.ganged { gap: 12px; padding: 14px; }
+  .wallplate.ganged .style-sunnata, .wallplate.ganged .style-seetouch, .wallplate.ganged .style-classic { width: 148px; }
+  .wallplate.ganged .style-sunnata .kbtn, .wallplate.ganged .style-seetouch .kbtn { letter-spacing: .07em; padding-left: 14px; padding-right: 14px; }
+  .wallplate.ganged .faceplate.current { box-shadow: 0 0 0 2px var(--kb-accent), 0 1px 3px rgba(0,0,0,.12); }
+  .fp-pos {
+    position: absolute; left: 0; right: 0; bottom: 5px; text-align: center;
+    font-size: 10px; letter-spacing: .1em; color: color-mix(in srgb, var(--fp-text) 55%, transparent);
+  }
+  .fp-empty { text-align: center; font-size: 12px; color: color-mix(in srgb, var(--fp-text) 55%, transparent); }
+
   .kbtn {
     position: relative; display: flex; align-items: center; justify-content: center;
     width: 100%; min-height: 44px; padding: 6px 20px; border-radius: 8px;
@@ -2374,18 +2681,73 @@ const STYLES = `
   .kbtn.is-hidden { opacity: .35; border-style: dashed; }
   .kbtn .dot { position: absolute; right: 8px; top: 50%; translate: 0 -50%; }
   .kbtn.has .dot { background: var(--kb-on); }
-  .kbtn .led {
-    position: absolute; left: 8px; top: 50%; translate: 0 -50%;
-    width: 4px; height: 12px; border-radius: 2px; background: color-mix(in srgb, var(--fp-text) 30%, transparent);
-  }
-  .kbtn .led.lit {
-    background: #ffd76a; box-shadow: 0 0 6px 2px rgba(255, 200, 80, .75);
-  }
   .kbtn.has-other .dot { background: var(--kb-other); }
   .kbtn.has-shared .dot { background: var(--kb-shared); }
+  .kbtn .led {
+    position: absolute; left: 8px; top: 50%; translate: 0 -50%;
+    width: 4px; height: 12px; border-radius: 2px; background: var(--led-off);
+  }
+  .kbtn .led.lit { background: #ffd76a; box-shadow: 0 0 6px 2px rgba(255, 200, 80, .75); }
   .pair { display: flex; gap: 8px; }
   .kbtn.small { min-height: 34px; padding: 4px 16px; font-size: 11px; }
   .kbtn.small.with-led { padding-left: 18px; padding-right: 14px; letter-spacing: .04em; }
+  .kbtn.arrow { font-size: 11px; letter-spacing: 0; }
+
+  /* real engravings can wrap onto two lines */
+  .style-sunnata .kbtn:not(.arrow):not(.small) .label, .style-seetouch .kbtn:not(.arrow):not(.small) .label {
+    white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+    line-height: 1.3; text-align: center;
+  }
+  .style-sunnata .kbtn.small, .style-seetouch .kbtn.small { padding: 4px 12px; letter-spacing: .05em; }
+
+  /* drag and drop */
+  .faceplate.editing { gap: 0; }
+  .faceplate.editing .kbtn { cursor: grab; }
+  .drop-row { height: max(var(--row-gap), 8px); border-radius: 4px; transition: height .12s, background .12s; }
+  .drop-row.drop-on { height: 18px; background: color-mix(in srgb, var(--kb-accent) 45%, transparent); }
+  .kbtn.drop-left { box-shadow: inset 5px 0 0 var(--kb-accent); }
+  .kbtn.drop-right { box-shadow: inset -5px 0 0 var(--kb-accent); }
+  .dragging { opacity: .4; }
+  .drag-handle { cursor: grab; color: var(--kb-muted); font-size: 18px; line-height: 1; padding: 2px 2px; user-select: none; }
+  .drag-handle:hover { color: var(--kb-text); }
+  .row.drop-before { box-shadow: 0 -3px 0 var(--kb-accent); }
+  .row.drop-after { box-shadow: 0 3px 0 var(--kb-accent); }
+
+  /* Sunnata: flat, crisp buttons with a slim white status light */
+  .style-sunnata { --row-gap: 6px; width: 164px; padding: 28px 14px; border-radius: 4px; }
+  .style-sunnata .kbtn {
+    min-height: 52px; border-radius: 2px; box-shadow: none;
+    background: color-mix(in srgb, var(--fp-btn-top) 70%, var(--fp-btn-bottom));
+    font-size: 10.5px; letter-spacing: .14em; font-weight: 500;
+  }
+  .style-sunnata .kbtn:hover { box-shadow: 0 0 0 1px color-mix(in srgb, var(--fp-text) 30%, transparent); }
+  .style-sunnata .kbtn.small { min-height: 36px; }
+  .style-sunnata .pair { gap: 6px; }
+  .style-sunnata .kbtn .led { left: 7px; width: 3px; height: 16px; border-radius: 1px; }
+  .style-sunnata .kbtn .led.lit { background: #f4f8ff; box-shadow: 0 0 6px 2px rgba(220, 235, 255, .8); }
+
+  /* seeTouch: beveled rectangular buttons, round LEDs beside each one, joined raise/lower rocker */
+  .style-seetouch { --row-gap: 8px; width: 172px; padding: 24px 14px 24px 26px; border-radius: 4px; }
+  .style-seetouch .kbtn {
+    min-height: 40px; border-radius: 3px; font-size: 10.5px; letter-spacing: .1em;
+    box-shadow: inset 0 1px 0 rgba(255,255,255,.55), inset 0 -2px 0 rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.2);
+  }
+  .style-seetouch .kbtn .led { left: -15px; width: 7px; height: 7px; border-radius: 50%; }
+  .style-seetouch .kbtn .led.lit { background: #eaf4ff; box-shadow: 0 0 5px 2px rgba(200, 225, 255, .85); }
+  .style-seetouch .pair { gap: 0; }
+  .style-seetouch .pair .kbtn:first-child { border-radius: 3px 0 0 3px; }
+  .style-seetouch .pair .kbtn:last-child { border-radius: 0 3px 3px 0; border-left: none; }
+
+  /* Pico: rounded remote, pill buttons, no LEDs */
+  .style-pico { --row-gap: 10px; width: 118px; padding: 30px 14px; border-radius: 48px; }
+  .style-pico .kbtn { border-radius: 999px; min-height: 38px; padding: 4px 12px; font-size: 10px; }
+  .style-pico .kbtn .led { display: none; }
+  .style-pico .pair { gap: 6px; }
+  .style-pico .kbtn.small { min-height: 30px; padding: 2px 6px; }
+  .style-pico.paddle { --row-gap: 0px; padding: 22px 16px; border-radius: 14px; }
+  .style-pico.paddle .kbtn { min-height: 118px; border-radius: 10px 10px 0 0; }
+  .style-pico.paddle .kbtn + .kbtn { border-radius: 0 0 10px 10px; border-top: none; }
+
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: transparent; vertical-align: middle; }
   .dot.on { background: var(--kb-on); }
   .dot.other { background: var(--kb-other); }

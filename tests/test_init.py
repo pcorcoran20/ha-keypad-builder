@@ -53,14 +53,16 @@ async def test_layout_round_trip(hass: HomeAssistant, hass_ws_client, hass_stora
     await client.send_json_auto_id({"type": "keypad_builder/layouts/get"})
     assert (await client.receive_json())["result"] == {}
 
-    layout = {"rows": [["on", "favorite"], ["off"]], "labels": {"favorite": "Dinner"}, "hidden": [], "finish": "brass", "junk": 1}
+    layout = {"rows": [["on", "favorite"], ["off"]], "labels": {"favorite": "Dinner"}, "hidden": [], "finish": "brass", "style": "seetouch", "junk": 1}
     await client.send_json_auto_id({"type": "keypad_builder/layouts/save", "device_id": "abc", "layout": layout})
     msg = await client.receive_json()
     assert msg["success"]
     assert "junk" not in msg["result"]
 
     await client.send_json_auto_id({"type": "keypad_builder/layouts/get"})
-    assert (await client.receive_json())["result"]["abc"]["finish"] == "brass"
+    saved = (await client.receive_json())["result"]["abc"]
+    assert saved["finish"] == "brass"
+    assert saved["style"] == "seetouch"
     assert hass_storage["keypad_builder.layouts"]["data"]["abc"]["labels"] == {"favorite": "Dinner"}
 
     await client.send_json_auto_id({"type": "keypad_builder/layouts/save", "device_id": "abc", "layout": None})

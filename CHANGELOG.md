@@ -2,6 +2,31 @@
 
 Release notes for each version. The Release workflow copies the matching section into the GitHub release, which is what HACS shows as the "release announcement".
 
+## v1.0.0
+
+The big redesign 🎉
+
+### 🖼️ Keypads that look like the real thing
+- New faceplate styles: **Sunnata** (flat buttons, slim white status lights), **seeTouch** (beveled buttons, round LEDs, joined raise/lower rocker) and **Pico** (rounded remote, or a split paddle for paddle Picos). The old look is still there as **Classic**
+- **Auto** picks the style from the model number. Change it any time in **Edit layout → Style**
+- Raise/lower buttons show ▲ ▼ like the real engraving, and long engravings wrap onto two lines
+
+### 🔲 Ganged wallboxes
+- Keypads Lutron names "Position 1 / 2 / 3" in the same spot now show **side by side in one multi-gang wallplate**
+- Tap any button on any keypad in the box to jump straight to it
+
+### ✋ Drag and drop
+- In **Edit layout**, drag buttons right on the keypad. Drop one on another button to put them side by side, or between rows to start a new row
+- Action steps have a ⠿ handle, so you can drag them into a new order
+
+### 🧱 Device tiles
+- "Choose what to control" is now a grid of tiles with checkboxes, room filter and type chips (💡 Lights, 🪟 Shades…)
+- **One step can control several things at once.** Pick as many tiles as you like, or use **Select all** for a room
+- Existing steps that already controlled several things now show as one step instead of being split up
+
+### ⬆️ Updating
+HACS → Keypad Builder → Update → restart Home Assistant → hard refresh your browser
+
 ## v0.7.0
 
 ### 📥 Import existing automations
