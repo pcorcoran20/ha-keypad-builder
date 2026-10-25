@@ -243,26 +243,229 @@ function delaySeconds(delay) {
   return null;
 }
 
-// Turn a saved automation action into one or more editor rows.
-// Anything we don't understand becomes a "raw" row so it's never lost.
-function parseAction(action) {
-  const raw = [{ kind: "raw", text: JSON.stringify(action, null, 2) }];
-  const keys = Object.keys(action);
+// Settings ("data") as editable key/value pairs instead of JSON.
+const fieldText = (v) => (typeof v === "string" ? v : JSON.stringify(v));
+function fieldValue(text) {
+  const t = String(text).trim();
+  if (/^-?\d+(\.\d+)?$/.test(t)) return Number(t);
+  if (t === "true" || t === "false") return t === "true";
+  if (/^[[{]/.test(t)) {
+    try {
+      return JSON.parse(t);
+    } catch (e) {
+      // not JSON after all, keep the text
+    }
+  }
+  return text;
+}
+const toFields = (data) => Object.entries(data || {}).map(([k, v]) => ({ k, v: fieldText(v) }));
+function fromFields(fields) {
+  const data = {};
+  for (const f of fields || []) if (f.k && f.k.trim()) data[f.k.trim()] = fieldValue(f.v ?? "");
+  return data;
+}
 
-  if (keys.length === 1 && "delay" in action) {
-    const seconds = delaySeconds(action.delay);
-    return seconds == null ? raw : [{ kind: "delay", seconds }];
+// Bits HA's own editor adds to steps. They're kept as-is but don't need showing.
+const PASSTHROUGH = ["metadata", "alias", "enabled", "continue_on_error"];
+const TARGET_EXTRAS = ["area_id", "device_id", "floor_id", "label_id"];
+
+// Device actions that are really just simple service calls.
+const DEVICE_ACTIONS = {
+  turn_on: "homeassistant.turn_on",
+  turn_off: "homeassistant.turn_off",
+  toggle: "homeassistant.toggle",
+  open: "cover.open_cover",
+  close: "cover.close_cover",
+  stop: "cover.stop_cover",
+};
+
+// ---------- conditions (for if / choose / repeat / "only keep going if") ----------
+
+const CONDITION_TYPES = [
+  ["state", "Device is…"],
+  ["numeric", "Number is above / below…"],
+  ["sun", "Sun (sunrise / sunset)"],
+  ["time", "Time / day"],
+];
+const WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+const isTime = (v) => v == null || /^\d{1,2}:\d{2}(:\d{2})?$/.test(v);
+
+function newCondition(type = "state") {
+  if (type === "numeric") return { type, entity: "", above: "", below: "" };
+  if (type === "sun") return { type, after: "sunset", before: "" };
+  if (type === "time") return { type, after: "", before: "", weekdays: [] };
+  return { type: "state", entity: "", state: "on" };
+}
+
+function parseCondition(c) {
+  if (c && typeof c === "object") {
+    const only = (allowed) => Object.keys(c).every((k) => allowed.includes(k));
+    const simple = (v) => v == null || typeof v === "number";
+    if (c.condition === "state" && typeof c.entity_id === "string" && ["string", "number"].includes(typeof c.state) && only(["condition", "entity_id", "state"])) {
+      return { type: "state", entity: c.entity_id, state: String(c.state) };
+    }
+    if (c.condition === "numeric_state" && typeof c.entity_id === "string" && only(["condition", "entity_id", "above", "below"]) && simple(c.above) && simple(c.below)) {
+      return { type: "numeric", entity: c.entity_id, above: c.above ?? "", below: c.below ?? "" };
+    }
+    if (c.condition === "sun" && only(["condition", "after", "before"])) {
+      return { type: "sun", after: c.after || "", before: c.before || "" };
+    }
+    if (c.condition === "time" && only(["condition", "after", "before", "weekday"]) && isTime(c.after) && isTime(c.before)) {
+      return { type: "time", after: c.after || "", before: c.before || "", weekdays: [].concat(c.weekday || []) };
+    }
+  }
+  return { type: "raw", text: JSON.stringify(c, null, 2) };
+}
+
+function buildCondition(c, where) {
+  const num = (v) => (v === "" || v == null ? undefined : Number(v));
+  switch (c.type) {
+    case "state":
+      if (!c.entity) throw new Error(`${where}: pick a device for the condition.`);
+      return { condition: "state", entity_id: c.entity, state: String(c.state || "on").trim() };
+    case "numeric": {
+      if (!c.entity) throw new Error(`${where}: pick what to measure.`);
+      const out = { condition: "numeric_state", entity_id: c.entity };
+      if (num(c.above) != null) out.above = num(c.above);
+      if (num(c.below) != null) out.below = num(c.below);
+      if (out.above == null && out.below == null) throw new Error(`${where}: fill in “above” or “below”.`);
+      return out;
+    }
+    case "sun": {
+      const out = { condition: "sun" };
+      if (c.after) out.after = c.after;
+      if (c.before) out.before = c.before;
+      if (!c.after && !c.before) throw new Error(`${where}: pick “after” or “before”.`);
+      return out;
+    }
+    case "time": {
+      const out = { condition: "time" };
+      if (c.after) out.after = c.after;
+      if (c.before) out.before = c.before;
+      if (c.weekdays?.length) out.weekday = c.weekdays;
+      if (Object.keys(out).length === 1) throw new Error(`${where}: pick a time or some days.`);
+      return out;
+    }
+    default:
+      try {
+        return JSON.parse(c.text);
+      } catch (e) {
+        throw new Error(`${where}: that JSON isn't valid (${e.message}).`);
+      }
+  }
+}
+
+// A list of conditions: "all of these" or "any of these" (an "or" wrapper).
+function parseConditionList(list) {
+  const items = [].concat(list ?? []);
+  const only = items[0] && typeof items[0] === "object" && Object.keys(items[0]).every((k) => ["condition", "conditions"].includes(k));
+  if (items.length === 1 && only && ["or", "and"].includes(items[0].condition) && Array.isArray(items[0].conditions)) {
+    return { match: items[0].condition === "or" ? "any" : "all", conditions: items[0].conditions.map(parseCondition) };
+  }
+  return { match: "all", conditions: items.map(parseCondition) };
+}
+
+function buildConditionList(owner, where) {
+  const conds = owner.conditions.map((c, i) => buildCondition(c, `${where}, condition ${i + 1}`));
+  if (!conds.length) throw new Error(`${where}: add at least one condition.`);
+  return owner.match === "any" && conds.length > 1 ? [{ condition: "or", conditions: conds }] : conds;
+}
+
+// Turn a saved automation action into editor rows. ctx.resolve maps an entity
+// registry id (what HA's device actions store) to an entity_id.
+// Anything we can't show as a normal step becomes a "raw" row (shown as a readable summary).
+function parseAction(action, ctx = {}) {
+  if (!action || typeof action !== "object") return [{ kind: "raw", text: JSON.stringify(action, null, 2) }];
+  const raw = [{ kind: "raw", text: JSON.stringify(action, null, 2) }];
+  const keep = {};
+  const rest = {};
+  for (const [k, v] of Object.entries(action)) (PASSTHROUGH.includes(k) ? keep : rest)[k] = v;
+  const withKeep = (row) => (Object.keys(keep).length ? { ...row, keep } : row);
+  const keys = Object.keys(rest);
+  const only = (allowed) => keys.every((k) => allowed.includes(k));
+  const steps = (list) => [].concat(list ?? []).flatMap((a) => parseAction(a, ctx));
+
+  // ----- blocks you can edit in the GUI -----
+  if (rest.if !== undefined && only(["if", "then", "else"])) {
+    return [withKeep({ kind: "if", ...parseConditionList(rest.if), then: steps(rest.then), else: rest.else ? steps(rest.else) : null })];
+  }
+  if (rest.choose !== undefined && only(["choose", "default"])) {
+    const options = [].concat(rest.choose);
+    if (options.every((o) => o && typeof o === "object" && Object.keys(o).every((k) => ["conditions", "sequence"].includes(k)))) {
+      return [
+        withKeep({
+          kind: "choose",
+          options: options.map((o) => ({ ...parseConditionList(o.conditions), rows: steps(o.sequence) })),
+          default: [].concat(rest.default ?? []).length ? steps(rest.default) : null,
+        }),
+      ];
+    }
+    return raw;
+  }
+  if (rest.repeat && only(["repeat"]) && typeof rest.repeat === "object") {
+    const r = rest.repeat;
+    const rk = Object.keys(r);
+    if (rk.includes("count") && rk.every((k) => ["count", "sequence"].includes(k)) && /^\d+$/.test(String(r.count))) {
+      return [withKeep({ kind: "repeat", mode: "count", count: Number(r.count), match: "all", conditions: [newCondition()], rows: steps(r.sequence) })];
+    }
+    for (const mode of ["while", "until"]) {
+      if (rk.includes(mode) && rk.every((k) => [mode, "sequence"].includes(k))) {
+        return [withKeep({ kind: "repeat", mode, count: 2, ...parseConditionList(r[mode]), rows: steps(r.sequence) })];
+      }
+    }
+    return raw;
+  }
+  if (typeof rest.condition === "string") {
+    return [withKeep({ kind: "condition", ...parseConditionList(rest) })];
   }
 
-  const service = action.action || action.service;
-  if (!service || !keys.every((k) => ["action", "service", "target", "data", "entity_id"].includes(k))) return raw;
-  if (action.target && Object.keys(action.target).some((k) => k !== "entity_id")) return raw;
+  if (keys.length === 1 && "delay" in rest) {
+    const seconds = delaySeconds(rest.delay);
+    return seconds == null ? raw : [withKeep({ kind: "delay", seconds })];
+  }
 
-  const data = { ...(action.data || {}) };
-  let entities = action.target?.entity_id ?? action.entity_id ?? data.entity_id;
+  // "scene: scene.movie" shorthand
+  if (keys.length === 1 && typeof rest.scene === "string") {
+    return [withKeep({ kind: "service", service: "scene.turn_on", entities: [rest.scene], brightness: null, transition: null })];
+  }
+
+  // device actions: turn on/off/toggle and shade open/close/stop become normal steps
+  if (rest.device_id && rest.domain && rest.type && !rest.action && !rest.service) {
+    const { device_id, domain, type, entity_id, ...extra } = rest;
+    const entity = entity_id ? (ctx.resolve ? ctx.resolve(entity_id) : entity_id) : null;
+    const service = DEVICE_ACTIONS[type];
+    if (entity && service) {
+      const extraKeys = Object.keys(extra);
+      if (!extraKeys.length) {
+        return [withKeep({ kind: "service", service, entities: [entity], brightness: null, transition: null })];
+      }
+      if (domain === "light" && type === "turn_on" && extraKeys.every((k) => ["brightness_pct", "transition"].includes(k))) {
+        return [
+          withKeep({
+            kind: "service",
+            service: "light.turn_on",
+            entities: [entity],
+            brightness: extra.brightness_pct ?? null,
+            transition: extra.transition ?? null,
+          }),
+        ];
+      }
+    }
+    return raw;
+  }
+
+  const service = rest.action || rest.service;
+  if (!service || !keys.every((k) => ["action", "service", "target", "data", "entity_id"].includes(k))) return raw;
+  if (rest.target && Object.keys(rest.target).some((k) => k !== "entity_id" && !TARGET_EXTRAS.includes(k))) return raw;
+
+  const data = { ...(rest.data || {}) };
+  let entities = rest.target?.entity_id ?? rest.entity_id ?? data.entity_id;
   delete data.entity_id;
   if (typeof entities === "string") entities = entities.split(",").map((e) => e.trim());
   entities = [].concat(entities || []).filter(Boolean);
+  // rooms, devices, floors and labels it targets (shown as chips)
+  const extraTargets = {};
+  for (const k of TARGET_EXTRAS) if (rest.target?.[k] != null) extraTargets[k] = [].concat(rest.target[k]);
 
   const preset = presetFor(service);
   if (preset) {
@@ -275,56 +478,86 @@ function parseAction(action) {
       delete extra.brightness_pct;
       delete extra.transition;
     }
-    if (Object.keys(extra).length === 0) {
-      return [{ kind: "service", service, entities, brightness, transition }];
-    }
+    return [withKeep({ kind: "service", service, entities, extraTargets, brightness, transition, fields: toFields(extra) })];
   }
-
-  const dataText = Object.keys(data).length ? JSON.stringify(data, null, 2) : "";
-  return [{ kind: "custom", service, entities, dataText }];
+  return [withKeep({ kind: "custom", service, entities, extraTargets, fields: toFields(data) })];
 }
 
 // Turn an editor row back into an automation action. Throws a friendly message on bad input.
-function buildAction(row, index) {
-  const n = index + 1;
+function buildAction(row, index, prefix = "Action") {
+  const n = `${prefix} ${index + 1}`;
+  const finish = (out) => ({ ...out, ...(row.keep || {}) });
+  const steps = (rows, label) => {
+    if (!rows?.length) throw new Error(`${n}: add at least one step to “${label}”.`);
+    return rows.map((r, j) => buildAction(r, j, `${n} → ${label}`));
+  };
+
+  if (row.kind === "if") {
+    const out = { if: buildConditionList(row, n), then: steps(row.then, "Then") };
+    if (row.else) out.else = steps(row.else, "Otherwise");
+    return finish(out);
+  }
+  if (row.kind === "choose") {
+    if (!row.options.length) throw new Error(`${n}: add at least one option.`);
+    const out = {
+      choose: row.options.map((o, k) => ({
+        conditions: buildConditionList(o, `${n}, option ${k + 1}`),
+        sequence: steps(o.rows, `Option ${k + 1}`),
+      })),
+    };
+    if (row.default) out.default = steps(row.default, "Otherwise");
+    return finish(out);
+  }
+  if (row.kind === "repeat") {
+    const repeat = { sequence: steps(row.rows, "Do") };
+    if (row.mode === "count") {
+      const count = Number(row.count);
+      if (!(count >= 1)) throw new Error(`${n}: repeat at least once.`);
+      repeat.count = count;
+    } else {
+      repeat[row.mode] = buildConditionList(row, n);
+    }
+    return finish({ repeat });
+  }
+  if (row.kind === "condition") {
+    const conds = buildConditionList(row, n);
+    return finish(conds.length === 1 ? conds[0] : { condition: "and", conditions: conds });
+  }
   if (row.kind === "delay") {
     const seconds = Number(row.seconds);
-    if (!(seconds >= 0)) throw new Error(`Action ${n}: wait time needs to be a number.`);
-    return { delay: { seconds } };
+    if (!(seconds >= 0)) throw new Error(`${n}: wait time needs to be a number.`);
+    return finish({ delay: { seconds } });
   }
   if (row.kind === "raw") {
     try {
       return JSON.parse(row.text);
     } catch (e) {
-      throw new Error(`Action ${n}: that JSON isn't valid (${e.message}).`);
+      throw new Error(`${n}: that JSON isn't valid (${e.message}).`);
     }
   }
 
   const service = (row.service || "").trim();
-  if (!/^[a-z0-9_]+\.[a-z0-9_]+$/.test(service)) throw new Error(`Action ${n}: pick an action like light.turn_on.`);
+  if (!/^[a-z0-9_]+\.[a-z0-9_]+$/.test(service)) throw new Error(`${n}: pick an action like light.turn_on.`);
   const entities = (row.entities || []).map((e) => e.trim()).filter(Boolean);
+  const extraTargets = Object.fromEntries(Object.entries(row.extraTargets || {}).filter(([, v]) => v?.length));
   const out = { action: service };
-  if (entities.length) out.target = { entity_id: entities.length === 1 ? entities[0] : entities };
+  if (entities.length || Object.keys(extraTargets).length) {
+    out.target = { ...extraTargets };
+    if (entities.length) out.target.entity_id = entities.length === 1 ? entities[0] : entities;
+  }
+  const data = fromFields(row.fields);
 
   if (row.kind === "service") {
-    if (!entities.length) throw new Error(`Action ${n}: pick a device/entity for "${presetFor(service)?.label || service}".`);
+    if (!entities.length && !Object.keys(extraTargets).length) {
+      throw new Error(`${n}: pick a device/entity for "${presetFor(service)?.label || service}".`);
+    }
     if (presetFor(service)?.brightness) {
-      const data = {};
       if (row.brightness !== null && row.brightness !== "") data.brightness_pct = Number(row.brightness);
       if (row.transition !== null && row.transition !== "") data.transition = Number(row.transition);
-      if (Object.keys(data).length) out.data = data;
-    }
-    return out;
-  }
-
-  if (row.dataText && row.dataText.trim()) {
-    try {
-      out.data = JSON.parse(row.dataText);
-    } catch (e) {
-      throw new Error(`Action ${n}: extra data isn't valid JSON (${e.message}).`);
     }
   }
-  return out;
+  if (Object.keys(data).length) out.data = data;
+  return finish(out);
 }
 
 // LED automations we write look like: state trigger on a source entity -> if on, LED on, else LED off.
@@ -341,8 +574,12 @@ function parseLed(config) {
 
 function newRow(kind) {
   if (kind === "delay") return { kind: "delay", seconds: 1 };
-  if (kind === "custom") return { kind: "custom", service: "", entities: [], dataText: "" };
-  return { kind: "service", service: kind, entities: [], brightness: presetFor(kind)?.brightness ? 100 : null, transition: null };
+  if (kind === "if") return { kind: "if", match: "all", conditions: [newCondition()], then: [], else: null };
+  if (kind === "choose") return { kind: "choose", options: [{ match: "all", conditions: [newCondition()], rows: [] }], default: null };
+  if (kind === "repeat") return { kind: "repeat", mode: "count", count: 2, match: "all", conditions: [newCondition()], rows: [] };
+  if (kind === "condition") return { kind: "condition", match: "all", conditions: [newCondition()] };
+  if (kind === "custom") return { kind: "custom", service: "", entities: [], fields: [] };
+  return { kind: "service", service: kind, entities: [], fields: [], brightness: presetFor(kind)?.brightness ? 100 : null, transition: null };
 }
 
 class KeypadBuilderPanel extends HTMLElement {
@@ -520,6 +757,9 @@ class KeypadBuilderPanel extends HTMLElement {
       // entity -> room, for the entity picker (entity's own room, else its device's room)
       const deviceArea = Object.fromEntries(devices.map((d) => [d.id, d.area_id]));
       this._areaName = areaName;
+      this._deviceName = Object.fromEntries(devices.map((d) => [d.id, d.name_by_user || d.name || "Device"]));
+      // HA's device actions store the entity registry id, not the entity_id
+      this._entityRegId = Object.fromEntries(entities.filter((e) => e.id).map((e) => [e.id, e.entity_id]));
       this._entityArea = Object.fromEntries(
         entities.map((e) => [e.entity_id, e.area_id || deviceArea[e.device_id] || null])
       );
@@ -644,21 +884,69 @@ class KeypadBuilderPanel extends HTMLElement {
     s.type = type && types.includes(type) ? type : types.includes("press") ? "press" : types[0];
     const config = s.configs[autoId(s.deviceId, button.subtype, s.type)];
     const actions = config ? [].concat(config.actions ?? config.action ?? []) : [];
-    s.rows = actions.flatMap(parseAction);
+    s.rows = actions.flatMap((a) => parseAction(a, this._parseCtx()));
     s.dirty = false;
     s.msg = null;
     this._render();
+  }
+
+  // ---------- steps live in nested lists; a path like "3.then.0" points at one ----------
+  // list paths: "" (top level), "<row>.then", "<row>.else", "<row>.do", "<row>.default", "<row>.opt<k>"
+
+  _getList(listPath) {
+    if (!listPath) return this._s.rows;
+    const dot = listPath.lastIndexOf(".");
+    const row = this._getRow(listPath.slice(0, dot));
+    const branch = listPath.slice(dot + 1);
+    if (!row) return null;
+    if (branch === "do") return row.rows;
+    if (branch.startsWith("opt")) return row.options[Number(branch.slice(3))]?.rows;
+    return row[branch];
+  }
+
+  _locate(path) {
+    const p = String(path);
+    const dot = p.lastIndexOf(".");
+    const listPath = dot < 0 ? "" : p.slice(0, dot);
+    return { listPath, list: this._getList(listPath), index: Number(p.slice(dot + 1)) };
+  }
+
+  _getRow(path) {
+    const { list, index } = this._locate(path);
+    return list?.[index];
+  }
+
+  // condition lists: "<row>|c" (the row's own) or "<row>|o<k>" (a choose option's)
+  _getCondOwner(condListPath) {
+    const [rowPath, which] = condListPath.split("|");
+    const row = this._getRow(rowPath);
+    if (!row) return null;
+    return which === "c" ? row : row.options?.[Number(which.slice(1))];
+  }
+
+  _getCond(condPath) {
+    const cut = condPath.lastIndexOf("|");
+    return this._getCondOwner(condPath.slice(0, cut))?.conditions[Number(condPath.slice(cut + 1))];
+  }
+
+  _changed(render = true) {
+    this._s.dirty = true;
+    this._s.msg = null;
+    if (render) this._render();
   }
 
   // Where a drag would land: an action step (above/below) or a keypad button (left/right) / gap between rows.
   _dropTarget(ev) {
     const drag = this._drag;
     if (drag.kind === "row") {
-      const rowEl = ev.target.closest?.(".rows .row");
+      // only reorder within the same list: walk out from the innermost step until we find a sibling
+      const parent = this._locate(drag.path).listPath;
+      let rowEl = ev.target.closest?.(".row[data-row-path]");
+      while (rowEl && this._locate(rowEl.dataset.rowPath).listPath !== parent) rowEl = rowEl.parentElement?.closest(".row[data-row-path]");
       if (!rowEl) return null;
       const rect = rowEl.getBoundingClientRect();
       const after = ev.clientY > rect.top + rect.height / 2;
-      return { el: rowEl, mark: after ? "drop-after" : "drop-before", index: Number(rowEl.dataset.rowIndex), after };
+      return { el: rowEl, mark: after ? "drop-after" : "drop-before", index: this._locate(rowEl.dataset.rowPath).index, after };
     }
     const zone = ev.target.closest?.(".faceplate.current .drop-row");
     if (zone) return { el: zone, mark: "drop-on", newRowAt: Number(zone.dataset.dropRow) };
@@ -742,7 +1030,7 @@ class KeypadBuilderPanel extends HTMLElement {
       // keep any non-keypad triggers someone added in HA's editor
       extra: [].concat(config.triggers ?? config.trigger ?? []).filter((t) => !isMember(t)),
     };
-    s.rows = [].concat(config.actions ?? config.action ?? []).flatMap(parseAction);
+    s.rows = [].concat(config.actions ?? config.action ?? []).flatMap((a) => parseAction(a, this._parseCtx()));
     Object.assign(s, { dirty: false, ledDirty: false, msg: null });
     this._render();
   }
@@ -789,7 +1077,7 @@ class KeypadBuilderPanel extends HTMLElement {
     if (!d.members.length) return fail("Add at least one button 💛");
     let actions;
     try {
-      actions = s.rows.map(buildAction);
+      actions = s.rows.map((r, i) => buildAction(r, i));
     } catch (e) {
       return fail(e.message);
     }
@@ -1253,7 +1541,7 @@ class KeypadBuilderPanel extends HTMLElement {
 
     let actions;
     try {
-      actions = s.rows.map(buildAction);
+      actions = s.rows.map((r, i) => buildAction(r, i));
     } catch (e) {
       s.msg = { type: "error", text: e.message };
       return this._render();
@@ -1328,7 +1616,7 @@ class KeypadBuilderPanel extends HTMLElement {
       const el = ev.target.closest("[data-act]");
       if (!el || el.disabled) return;
       const s = this._s;
-      const i = Number(el.dataset.row);
+      const i = el.dataset.row;
       switch (el.dataset.act) {
         case "device-plate":
           return s.editingLayout ? undefined : this._selectDevice(el.dataset.id);
@@ -1347,23 +1635,57 @@ class KeypadBuilderPanel extends HTMLElement {
         case "type":
           return this._selectButton(s.sel, el.dataset.type);
         case "add":
-          s.rows.push(newRow("homeassistant.toggle"));
-          s.dirty = true;
-          s.msg = null;
-          return this._render();
-        case "remove":
-          s.rows.splice(i, 1);
-          s.dirty = true;
-          s.msg = null;
-          return this._render();
+          this._getList(el.dataset.list || "").push(newRow("homeassistant.toggle"));
+          return this._changed();
+        case "remove": {
+          const { list, index } = this._locate(i);
+          list.splice(index, 1);
+          return this._changed();
+        }
         case "up":
         case "down": {
-          const j = el.dataset.act === "up" ? i - 1 : i + 1;
-          if (j < 0 || j >= s.rows.length) return;
-          [s.rows[i], s.rows[j]] = [s.rows[j], s.rows[i]];
-          s.dirty = true;
-          s.msg = null;
-          return this._render();
+          const { list, index } = this._locate(i);
+          const j = el.dataset.act === "up" ? index - 1 : index + 1;
+          if (j < 0 || j >= list.length) return;
+          [list[index], list[j]] = [list[j], list[index]];
+          return this._changed();
+        }
+        case "blk-else-add":
+          this._getRow(i).else = [];
+          return this._changed();
+        case "blk-default-add":
+          this._getRow(i).default = [];
+          return this._changed();
+        case "blk-branch-remove": {
+          const row = this._getRow(i);
+          const key = el.dataset.branch;
+          if (row[key]?.length && !confirm("Remove “otherwise” and the steps in it?")) return;
+          row[key] = null;
+          return this._changed();
+        }
+        case "opt-add":
+          this._getRow(i).options.push({ match: "all", conditions: [newCondition()], rows: [] });
+          return this._changed();
+        case "opt-remove": {
+          const row = this._getRow(i);
+          const k = Number(el.dataset.k);
+          if (row.options[k].rows.length && !confirm(`Remove option ${k + 1} and its steps?`)) return;
+          row.options.splice(k, 1);
+          return this._changed();
+        }
+        case "c-add":
+          this._getCondOwner(el.dataset.clist).conditions.push(newCondition());
+          return this._changed();
+        case "c-remove": {
+          const cut = el.dataset.c.lastIndexOf("|");
+          this._getCondOwner(el.dataset.c.slice(0, cut)).conditions.splice(Number(el.dataset.c.slice(cut + 1)), 1);
+          return this._changed();
+        }
+        case "c-day": {
+          const cond = this._getCond(el.dataset.c);
+          const day = el.dataset.day;
+          cond.weekdays = cond.weekdays.includes(day) ? cond.weekdays.filter((d) => d !== day) : WEEKDAYS.filter((d) => d === day || cond.weekdays.includes(d));
+          return this._changed();
         }
         case "save":
           return this._save();
@@ -1412,6 +1734,22 @@ class KeypadBuilderPanel extends HTMLElement {
           return this._closePicker();
         case "pick-choose":
           return this._choose(el.dataset.entity);
+        case "f-add":
+          (this._getRow(i).fields ||= []).push({ k: "", v: "" });
+          s.dirty = true;
+          return this._render();
+        case "f-remove":
+          this._getRow(i).fields.splice(Number(el.dataset.f), 1);
+          s.dirty = true;
+          return this._render();
+        case "t-remove": {
+          const row = this._getRow(i);
+          const list = row.extraTargets?.[el.dataset.tkey] || [];
+          row.extraTargets[el.dataset.tkey] = list.filter((v) => v !== el.dataset.tval);
+          s.dirty = true;
+          s.msg = null;
+          return this._render();
+        }
         case "pick-done":
           return this._applyPicker(this._picker.selected);
         case "pick-room":
@@ -1466,7 +1804,7 @@ class KeypadBuilderPanel extends HTMLElement {
       const handle = ev.target.closest?.("[data-drag-row]");
       if (handle) {
         const rowEl = handle.closest(".row");
-        this._drag = { kind: "row", index: Number(handle.dataset.dragRow) };
+        this._drag = { kind: "row", path: handle.dataset.dragRow };
         ev.dataTransfer.setDragImage(rowEl, 24, 24);
         rowEl.classList.add("dragging");
       } else {
@@ -1498,11 +1836,12 @@ class KeypadBuilderPanel extends HTMLElement {
       this._drag = null;
       const s = this._s;
       if (drag.kind === "row") {
+        const { list, index: from } = this._locate(drag.path);
         let to = target.index + (target.after ? 1 : 0);
-        if (drag.index < to) to--;
-        if (to === drag.index) return this._render();
-        const [moved] = s.rows.splice(drag.index, 1);
-        s.rows.splice(to, 0, moved);
+        if (from < to) to--;
+        if (to === from) return this._render();
+        const [moved] = list.splice(from, 1);
+        list.splice(to, 0, moved);
         s.dirty = true;
         s.msg = null;
         return this._render();
@@ -1560,14 +1899,32 @@ class KeypadBuilderPanel extends HTMLElement {
         if (btn && !btn.classList.contains("arrow")) btn.querySelector(".label").textContent = this._layoutLabel(key);
         return;
       }
+      if (el.dataset.fkey != null || el.dataset.fval != null) {
+        const field = this._getRow(el.dataset.row)?.fields?.[Number(el.dataset.fkey ?? el.dataset.fval)];
+        if (!field) return;
+        field[el.dataset.fkey != null ? "k" : "v"] = el.value;
+        s.dirty = true;
+        return;
+      }
+      if (el.dataset.cfield != null) {
+        const cond = this._getCond(el.dataset.c);
+        if (!cond) return;
+        cond[el.dataset.cfield] = el.value;
+        return this._changed(el.tagName === "SELECT");
+      }
+      if (el.dataset.match != null) {
+        this._getCondOwner(el.dataset.match).match = el.value;
+        return this._changed(false);
+      }
       if (el.dataset.field == null) return;
-      const row = s.rows[Number(el.dataset.row)];
+      const row = this._getRow(el.dataset.row);
       if (!row) return;
       row[el.dataset.field] = el.value;
       s.dirty = true;
       s.msg = null;
+      if (el.dataset.rerender) return this._render();
       if (el.dataset.field === "brightness") {
-        const out = root.querySelector(`#bval-${el.dataset.row}`);
+        const out = root.querySelector(`#${CSS.escape(`bval-${el.dataset.row}`)}`);
         if (out) out.textContent = `${el.value}%`;
       }
     });
@@ -1616,16 +1973,31 @@ class KeypadBuilderPanel extends HTMLElement {
       if (el.dataset.lfield) {
         return this._changeLayout((d) => (d[el.dataset.lfield] = el.value));
       }
+      if (el.dataset.ctype != null) {
+        const cut = el.dataset.ctype.lastIndexOf("|");
+        const owner = this._getCondOwner(el.dataset.ctype.slice(0, cut));
+        const k = Number(el.dataset.ctype.slice(cut + 1));
+        const next = newCondition(el.value);
+        if ("entity" in next && owner.conditions[k].entity) next.entity = owner.conditions[k].entity;
+        owner.conditions[k] = next;
+        return this._changed();
+      }
       if (el.dataset.kind != null) {
-        const i = Number(el.dataset.kind);
-        const old = s.rows[i];
+        const { list, index: i } = this._locate(el.dataset.kind);
+        const old = list[i];
         const row = newRow(el.value);
         // keep the chosen entity when switching between similar actions
         if (presetFor(el.value)?.led) {
           const led = s.view === "keypad" && this._current()?.button.ledEntity;
           row.entities = led ? [led] : [];
         } else if ("entities" in row && old.entities?.length) row.entities = [...old.entities];
-        s.rows[i] = row;
+        if ("entities" in row && old.extraTargets) row.extraTargets = old.extraTargets;
+        if (old.keep) row.keep = old.keep;
+        // switching to a block keeps the step that was here inside it
+        if (["if", "repeat"].includes(row.kind) && !["if", "choose", "repeat", "condition"].includes(old.kind)) {
+          (row.kind === "if" ? row.then : row.rows).push(old);
+        }
+        list[i] = row;
         s.dirty = true;
         s.msg = null;
         this._render();
@@ -1907,10 +2279,7 @@ class KeypadBuilderPanel extends HTMLElement {
           .join("")}
       </div>
       <p class="muted">Actions run top to bottom.</p>
-      <div class="rows">
-        ${s.rows.length ? s.rows.map((r, i) => this._renderRow(r, i)).join("") : `<div class="muted empty-rows">No actions yet, add one below 👇</div>`}
-      </div>
-      <button class="add" data-act="add">＋ Add action</button>
+      ${this._renderList(s.rows, "")}
       ${s.msg ? `<div class="msg ${s.msg.type}">${esc(s.msg.text)}</div>` : ""}
       <div class="footer">
         ${exists ? `<button class="danger" data-act="delete" ${s.busy ? "disabled" : ""}>Remove</button>` : ""}
@@ -1920,7 +2289,7 @@ class KeypadBuilderPanel extends HTMLElement {
       </div>
       ${
         exists
-          ? `<div class="advanced">Want conditions, choose blocks or other fancy stuff?
+          ? `<div class="advanced">Need something this editor doesn't have, like triggers from other things?
               <button class="link" data-act="open-editor" data-id="${esc(cur.id)}">Open in HA automation editor ↗</button>
               <div class="muted">Changes you make there show up here too.</div></div>`
           : ""
@@ -2013,10 +2382,7 @@ class KeypadBuilderPanel extends HTMLElement {
       <div class="section">
         <h3>Actions</h3>
         <p class="muted">Actions run top to bottom.</p>
-        <div class="rows">
-          ${s.rows.length ? s.rows.map((r, i) => this._renderRow(r, i)).join("") : `<div class="muted empty-rows">No actions yet, add one below 👇</div>`}
-        </div>
-        <button class="add" data-act="add">＋ Add action</button>
+        ${this._renderList(s.rows, "")}
       </div>
       ${s.msg ? `<div class="msg ${s.msg.type}">${esc(s.msg.text)}</div>` : ""}
       <div class="footer">
@@ -2027,7 +2393,7 @@ class KeypadBuilderPanel extends HTMLElement {
       </div>
       ${
         d.id
-          ? `<div class="advanced">Want conditions or other fancy stuff?
+          ? `<div class="advanced">Need something this editor doesn't have?
               <button class="link" data-act="open-editor" data-id="${esc(d.id)}">Open in HA automation editor ↗</button></div>`
           : ""
       }`;
@@ -2165,53 +2531,184 @@ class KeypadBuilderPanel extends HTMLElement {
       </div>`;
   }
 
+  // A list of steps (the top level, or the inside of an if / choose / repeat).
+  _renderList(rows, listPath) {
+    const top = !listPath;
+    const at = (j) => (top ? `${j}` : `${listPath}.${j}`);
+    return `<div class="rows ${top ? "" : "nested"}">
+        ${rows.length ? rows.map((r, j) => this._renderRow(r, at(j))).join("") : `<div class="muted empty-rows">${top ? "No actions yet, add one below 👇" : "No steps yet"}</div>`}
+      </div>
+      <button class="add ${top ? "" : "add-small"}" data-act="add" data-list="${esc(listPath)}">＋ ${top ? "Add action" : "Add step"}</button>`;
+  }
+
+  _renderConditions(owner, condListPath) {
+    const conds = owner.conditions || [];
+    return `<div class="conds">
+      ${
+        conds.length > 1
+          ? `<select class="match" data-match="${esc(condListPath)}">
+              <option value="all" ${owner.match !== "any" ? "selected" : ""}>All of these are true</option>
+              <option value="any" ${owner.match === "any" ? "selected" : ""}>Any of these is true</option>
+            </select>`
+          : ""
+      }
+      ${conds.map((c, k) => this._renderCondition(c, `${condListPath}|${k}`)).join("")}
+      <div><button class="link small" data-act="c-add" data-clist="${esc(condListPath)}">＋ Add condition</button></div>
+    </div>`;
+  }
+
+  _renderCondition(c, cp) {
+    const types = [...CONDITION_TYPES, ...(c.type === "raw" ? [["raw", "Advanced condition"]] : [])]
+      .map(([v, l]) => `<option value="${v}" ${v === c.type ? "selected" : ""}>${esc(l)}</option>`)
+      .join("");
+    const sunOpts = (v) =>
+      [["", "—"], ["sunrise", "sunrise"], ["sunset", "sunset"]].map(([o, l]) => `<option value="${o}" ${o === v ? "selected" : ""}>${l}</option>`).join("");
+    let body = "";
+    if (c.type === "state") {
+      body = `${this._entityButton([c.entity], `cond-${cp}`, "Pick a device…")}
+        <div class="inline"><label>is</label>
+          <input list="dl-states" placeholder="on" value="${esc(c.state)}" data-c="${esc(cp)}" data-cfield="state"></div>`;
+    } else if (c.type === "numeric") {
+      body = `${this._entityButton([c.entity], `cond-${cp}`, "Pick a sensor or number…")}
+        <div class="inline"><label>above</label><input type="number" step="any" value="${esc(c.above)}" data-c="${esc(cp)}" data-cfield="above">
+          <label class="mini">below</label><input type="number" step="any" value="${esc(c.below)}" data-c="${esc(cp)}" data-cfield="below"></div>`;
+    } else if (c.type === "sun") {
+      body = `<div class="inline"><label>after</label><select data-c="${esc(cp)}" data-cfield="after">${sunOpts(c.after)}</select>
+        <label class="mini">before</label><select data-c="${esc(cp)}" data-cfield="before">${sunOpts(c.before)}</select></div>`;
+    } else if (c.type === "time") {
+      body = `<div class="inline"><label>after</label><input type="time" value="${esc(c.after)}" data-c="${esc(cp)}" data-cfield="after">
+          <label class="mini">before</label><input type="time" value="${esc(c.before)}" data-c="${esc(cp)}" data-cfield="before"></div>
+        <div class="day-chips">${WEEKDAYS.map(
+          (d) => `<button class="tchip ${c.weekdays.includes(d) ? "on" : ""}" data-act="c-day" data-c="${esc(cp)}" data-day="${d}">${pretty(d)}</button>`
+        ).join("")}<span class="muted">${c.weekdays.length ? "" : "any day"}</span></div>`;
+    } else {
+      let parsed = null;
+      try {
+        parsed = JSON.parse(c.text);
+      } catch (e) {
+        // shown as an error
+      }
+      body = `<div class="block-summary">${parsed ? `✋ ${esc(this._describeCondition(parsed))}` : `<span class="warn">⚠️ This condition's JSON has an error</span>`}</div>
+        <details class="json-details"><summary>Advanced: edit as JSON</summary>
+          <textarea rows="4" data-c="${esc(cp)}" data-cfield="text">${esc(c.text)}</textarea></details>`;
+    }
+    return `<div class="cond">
+      <div class="cond-head"><select data-ctype="${esc(cp)}">${types}</select>
+        <button class="icon" data-act="c-remove" data-c="${esc(cp)}" title="Remove condition">✕</button></div>
+      ${body}
+    </div>`;
+  }
+
   _renderRow(row, i) {
     const kindValue = row.kind === "service" ? row.service : row.kind;
     const options = [
       ...PRESETS.map((p) => [p.service, p.label]),
       ["delay", "Wait"],
+      ["if", "🔀 If / then / otherwise"],
+      ["choose", "🔀 Choose (options)"],
+      ["repeat", "🔁 Repeat"],
+      ["condition", "✋ Only keep going if…"],
       ["custom", "Custom action…"],
-      ...(row.kind === "raw" ? [["raw", "Advanced (JSON)"]] : []),
+      ...(row.kind === "raw" ? [["raw", "Advanced step"]] : []),
     ]
       .map(([v, l]) => `<option value="${esc(v)}" ${v === kindValue ? "selected" : ""}>${esc(l)}</option>`)
       .join("");
+    const branch = (label, key) => `<div class="blk-label">${label}
+        <button class="link small" data-act="blk-branch-remove" data-row="${esc(i)}" data-branch="${key}">remove</button></div>`;
 
     let body = "";
     if (row.kind === "service") {
       const preset = presetFor(row.service);
       body = `
         ${this._entityButton(row.entities, `row-${i}`, preset.led ? "Choose a keypad LED…" : "Choose what to control…")}
+        ${this._renderTargetChips(row, i)}
         ${
           preset.brightness
             ? `<div class="inline">
                 <label>Brightness</label>
                 <input type="range" min="1" max="100" value="${esc(row.brightness ?? 100)}" data-row="${i}" data-field="brightness">
-                <span id="bval-${i}" class="val">${esc(row.brightness ?? 100)}%</span>
+                <span id="bval-${esc(i)}" class="val">${esc(row.brightness ?? 100)}%</span>
               </div>
               <div class="inline">
                 <label>Fade (sec)</label>
                 <input type="number" min="0" step="0.5" placeholder="optional" value="${esc(row.transition ?? "")}" data-row="${i}" data-field="transition">
               </div>`
             : ""
-        }`;
+        }
+        ${row.fields?.length ? this._renderFields(row, i, "More settings") : `<div><button class="link small" data-act="f-add" data-row="${i}">＋ More settings</button></div>`}`;
     } else if (row.kind === "custom") {
       body = `
         <input class="grow" list="dl-services" placeholder="action, e.g. light.turn_on" value="${esc(row.service)}" data-row="${i}" data-field="service">
         ${this._entityButton(row.entities, `row-${i}`, "Entity (optional)…")}
-        <textarea rows="3" placeholder='extra data as JSON, e.g. {"color_name": "pink"}' data-row="${i}" data-field="dataText">${esc(row.dataText)}</textarea>`;
+        ${this._renderTargetChips(row, i)}
+        ${this._renderFields(row, i, "Settings")}`;
+    } else if (row.kind === "if") {
+      body = `<div class="blk">
+        <div class="blk-label">If</div>${this._renderConditions(row, `${i}|c`)}
+        <div class="blk-label">Then</div>${this._renderList(row.then, `${i}.then`)}
+        ${
+          row.else
+            ? branch("Otherwise", "else") + this._renderList(row.else, `${i}.else`)
+            : `<div><button class="link small" data-act="blk-else-add" data-row="${esc(i)}">＋ Add “otherwise”</button></div>`
+        }
+      </div>`;
+    } else if (row.kind === "choose") {
+      body = `<div class="blk">
+        ${row.options
+          .map(
+            (o, k) => `<div class="blk-option">
+              <div class="blk-label">Option ${k + 1}: when
+                <button class="link small" data-act="opt-remove" data-row="${esc(i)}" data-k="${k}">remove</button></div>
+              ${this._renderConditions(o, `${i}|o${k}`)}
+              <div class="blk-label">Do</div>${this._renderList(o.rows, `${i}.opt${k}`)}
+            </div>`
+          )
+          .join("")}
+        <div><button class="link small" data-act="opt-add" data-row="${esc(i)}">＋ Add option</button></div>
+        ${
+          row.default
+            ? branch("Otherwise (nothing matched)", "default") + this._renderList(row.default, `${i}.default`)
+            : `<div><button class="link small" data-act="blk-default-add" data-row="${esc(i)}">＋ Add “otherwise”</button></div>`
+        }
+      </div>`;
+    } else if (row.kind === "repeat") {
+      const modes = [["count", "a number of times"], ["while", "while…"], ["until", "until…"]]
+        .map(([v, l]) => `<option value="${v}" ${v === row.mode ? "selected" : ""}>${l}</option>`)
+        .join("");
+      body = `<div class="blk">
+        <div class="inline"><label>Repeat</label>
+          <select data-row="${esc(i)}" data-field="mode" data-rerender="1">${modes}</select>
+          ${row.mode === "count" ? `<input type="number" min="1" value="${esc(row.count)}" data-row="${esc(i)}" data-field="count"><span class="muted">times</span>` : ""}
+        </div>
+        ${row.mode !== "count" ? this._renderConditions(row, `${i}|c`) : ""}
+        <div class="blk-label">Do</div>${this._renderList(row.rows, `${i}.do`)}
+      </div>`;
+    } else if (row.kind === "condition") {
+      body = `<div class="blk"><div class="blk-label">Only keep going if</div>${this._renderConditions(row, `${i}|c`)}</div>`;
     } else if (row.kind === "delay") {
       body = `<div class="inline"><label>Seconds</label>
         <input type="number" min="0" step="0.5" value="${esc(row.seconds)}" data-row="${i}" data-field="seconds"></div>`;
     } else {
-      body = `<p class="muted">This step was made somewhere else, so it's shown as JSON. It's kept as-is unless you edit it.</p>
-        <textarea rows="6" data-row="${i}" data-field="text">${esc(row.text)}</textarea>`;
+      let parsed = null;
+      try {
+        parsed = JSON.parse(row.text);
+      } catch (e) {
+        // shown as an error below
+      }
+      const editId = this._editingAutomationId();
+      body = `
+        <div class="block-summary">${parsed ? this._describeHtml(parsed) : `<span class="warn">⚠️ This step's JSON has an error</span>`}</div>
+        ${editId ? `<div><button class="link small" data-act="open-editor" data-id="${esc(editId)}">Edit this step in HA's editor ↗</button></div>` : ""}
+        <details class="json-details"><summary>Advanced: edit as JSON</summary>
+          <textarea rows="6" data-row="${i}" data-field="text">${esc(row.text)}</textarea>
+        </details>`;
     }
 
     return `
-      <div class="row" data-row-index="${i}">
+      <div class="row ${["if", "choose", "repeat", "condition"].includes(row.kind) ? "block-row" : ""}" data-row-path="${esc(i)}">
         <div class="row-head">
-          <span class="drag-handle" draggable="true" data-drag-row="${i}" title="Drag to reorder">⠿</span>
-          <span class="num">${i + 1}</span>
+          <span class="drag-handle" draggable="true" data-drag-row="${esc(i)}" title="Drag to reorder">⠿</span>
+          <span class="num">${Number(String(i).split(".").pop()) + 1}</span>
           <select data-kind="${i}">${options}</select>
           <button class="icon" data-act="up" data-row="${i}" title="Move up">↑</button>
           <button class="icon" data-act="down" data-row="${i}" title="Move down">↓</button>
@@ -2221,11 +2718,177 @@ class KeypadBuilderPanel extends HTMLElement {
       </div>`;
   }
 
+  _renderFields(row, i, title) {
+    const fields = row.fields || [];
+    return `<div class="fields">
+      <div class="fields-title">${esc(title)}</div>
+      ${fields
+        .map(
+          (f, j) => `<div class="field-row">
+            <input placeholder="setting, e.g. color_name" value="${esc(f.k)}" data-row="${i}" data-fkey="${j}">
+            <input placeholder="value, e.g. pink" value="${esc(f.v)}" data-row="${i}" data-fval="${j}">
+            <button class="icon" data-act="f-remove" data-row="${i}" data-f="${j}" title="Remove setting">✕</button>
+          </div>`
+        )
+        .join("")}
+      <div><button class="link small" data-act="f-add" data-row="${i}">＋ Add setting</button></div>
+    </div>`;
+  }
+
+  // Rooms, devices, floors and labels a step targets, as removable chips.
+  _renderTargetChips(row, i) {
+    const icons = { area_id: "🏠", device_id: "📟", floor_id: "🏢", label_id: "🏷️" };
+    const nameOf = (k, v) =>
+      k === "area_id" ? this._areaName?.[v] || pretty(v) : k === "device_id" ? this._deviceName?.[v] || "Device" : pretty(v);
+    const chips = Object.entries(row.extraTargets || {}).flatMap(([k, list]) =>
+      (list || []).map(
+        (v) => `<span class="ef-chip target-chip">${icons[k]} ${esc(nameOf(k, v))}
+          <button class="chip-x" data-act="t-remove" data-row="${i}" data-tkey="${esc(k)}" data-tval="${esc(v)}" title="Remove">✕</button></span>`
+      )
+    );
+    return chips.length ? `<div class="target-chips"><span class="muted">Also controls:</span> ${chips.join("")}</div>` : "";
+  }
+
+  // ---------- readable summaries for advanced steps ----------
+
+  _parseCtx() {
+    return { resolve: (id) => (this._hass.states[id] ? id : this._entityRegId?.[id] || null) };
+  }
+
+  _editingAutomationId() {
+    const s = this._s;
+    if (s.view === "shared") return s.sharedDraft?.id || null;
+    const cur = this._current();
+    return cur && s.configs[cur.id] ? cur.id : null;
+  }
+
+  _names(ids) {
+    const resolve = this._parseCtx().resolve;
+    return [].concat(ids ?? [])
+      .map((id) => {
+        const real = typeof id === "string" ? resolve(id) || id : String(id);
+        return this._hass.states[real]?.attributes.friendly_name || real;
+      })
+      .join(", ");
+  }
+
+  _describeCondition(c) {
+    if (typeof c === "string") return "a template is true";
+    if (!c || typeof c !== "object") return "a condition";
+    const list = (items, joiner) => [].concat(items || []).map((x) => this._describeCondition(x)).join(joiner);
+    switch (c.condition) {
+      case "state":
+        return `${this._names(c.entity_id)} is ${[].concat(c.state).join(" or ")}${c.attribute ? ` (${c.attribute})` : ""}`;
+      case "numeric_state":
+        return `${this._names(c.entity_id)}${c.above != null ? ` is above ${c.above}` : ""}${c.above != null && c.below != null ? " and" : ""}${c.below != null ? ` is below ${c.below}` : ""}`;
+      case "sun":
+        return [c.after && `after ${c.after}`, c.before && `before ${c.before}`].filter(Boolean).join(" and ") || "a sun condition";
+      case "time": {
+        const parts = [c.after && `after ${c.after}`, c.before && `before ${c.before}`, c.weekday && `on ${[].concat(c.weekday).join(", ")}`];
+        return parts.filter(Boolean).join(" ") || "a time condition";
+      }
+      case "template":
+        return "a template is true";
+      case "and":
+        return list(c.conditions, " and ");
+      case "or":
+        return list(c.conditions, " or ");
+      case "not":
+        return `not (${list(c.conditions, " or ")})`;
+      case "zone":
+        return `${this._names(c.entity_id)} is in ${this._names(c.zone)}`;
+      case "trigger":
+        return `it was started by “${[].concat(c.id).join(", ")}”`;
+      case "device":
+        return `${this._deviceName?.[c.device_id] || "a device"} is ${pretty(c.type || "in a state").toLowerCase()}`;
+      default:
+        return c.condition ? `${pretty(c.condition).toLowerCase()} condition` : "a condition";
+    }
+  }
+
+  _conditions(list) {
+    return [].concat(list || []).map((c) => this._describeCondition(c)).join(" and ") || "always";
+  }
+
+  _describe(a) {
+    if (!a || typeof a !== "object") return { icon: "🧩", text: "Custom step" };
+    const svc = a.action || a.service;
+    if (svc) {
+      const label = presetFor(svc)?.label || pretty(svc.split(".").pop());
+      const who = [this._names(a.target?.entity_id ?? a.entity_id ?? a.data?.entity_id)];
+      if (a.target?.area_id) who.push(`everything in ${[].concat(a.target.area_id).map((x) => this._areaName?.[x] || pretty(x)).join(", ")}`);
+      if (a.target?.device_id) who.push([].concat(a.target.device_id).map((x) => this._deviceName?.[x] || "a device").join(", "));
+      const target = who.filter(Boolean).join(", ");
+      return { icon: "▶️", text: `${label}${target ? `: ${target}` : ""}` };
+    }
+    if ("delay" in a) {
+      const sec = delaySeconds(a.delay);
+      return { icon: "⏱", text: sec != null ? `Wait ${sec} second${sec === 1 ? "" : "s"}` : "Wait (worked out by a template)" };
+    }
+    if (a.if) {
+      return {
+        icon: "🔀",
+        text: `If ${this._conditions(a.if)}`,
+        groups: [{ label: "Then", actions: a.then }, a.else && { label: "Otherwise", actions: a.else }].filter(Boolean),
+      };
+    }
+    if (a.choose) {
+      return {
+        icon: "🔀",
+        text: "Pick the first option that matches",
+        groups: [
+          ...[].concat(a.choose).map((o) => ({ label: `When ${this._conditions(o.conditions)}`, actions: o.sequence })),
+          a.default && { label: "Otherwise", actions: a.default },
+        ].filter(Boolean),
+      };
+    }
+    if (a.repeat) {
+      const r = a.repeat;
+      const how =
+        r.count != null ? `${r.count} times` : r.while ? `while ${this._conditions(r.while)}` : r.until ? `until ${this._conditions(r.until)}` : "for each item";
+      return { icon: "🔁", text: `Repeat ${how}`, groups: [{ label: "Do", actions: r.sequence }] };
+    }
+    if (a.wait_for_trigger) return { icon: "⏳", text: "Wait for something to happen" };
+    if (a.wait_template) return { icon: "⏳", text: "Wait until a template is true" };
+    if (a.condition) return { icon: "✋", text: `Only keep going if ${this._describeCondition(a)}` };
+    if (a.event) return { icon: "📣", text: `Send event “${a.event}”` };
+    if (a.variables) return { icon: "🧮", text: `Set ${Object.keys(a.variables).join(", ")}` };
+    if ("stop" in a) return { icon: "⏹", text: `Stop${a.stop ? `: ${a.stop}` : ""}` };
+    if (a.parallel) return { icon: "⚡", text: "Do these at the same time", groups: [{ label: "", actions: a.parallel }] };
+    if (a.sequence) return { icon: "📋", text: "Do these in order", groups: [{ label: "", actions: a.sequence }] };
+    if (a.scene) return { icon: "🎬", text: `Activate ${this._names(a.scene)}` };
+    if (a.device_id) {
+      const what = a.entity_id ? this._names(a.entity_id) : this._deviceName?.[a.device_id] || "a device";
+      return { icon: "⚙️", text: `${pretty(a.type || "device action")}: ${what}` };
+    }
+    return { icon: "🧩", text: "Custom step" };
+  }
+
+  _describeHtml(a, depth = 0) {
+    if (depth > 5) return `<div class="desc muted">…</div>`;
+    const { icon, text, groups } = this._describe(a);
+    const title = a?.alias ? `${a.alias}` : text;
+    const sub = a?.alias ? `<span class="desc-sub">${esc(text)}</span>` : "";
+    const off = a?.enabled === false ? ` <span class="chip">turned off</span>` : "";
+    return `<div class="desc">
+      <div class="desc-line">${icon} ${esc(title)}${off}${sub}</div>
+      ${(groups || [])
+        .map(
+          (g) => `<div class="desc-group">${g.label ? `<div class="desc-label">${esc(g.label)}</div>` : ""}${
+            [].concat(g.actions || []).map((x) => this._describeHtml(x, depth + 1)).join("") || `<div class="desc muted">nothing</div>`
+          }</div>`
+        )
+        .join("")}
+    </div>`;
+  }
+
   _renderDatalists() {
     const services = Object.entries(this._hass.services || {}).flatMap(([d, svcs]) =>
       Object.keys(svcs).map((svc) => `<option value="${esc(`${d}.${svc}`)}"></option>`)
     );
-    return `<datalist id="dl-services">${services.join("")}</datalist>`;
+    const states = ["on", "off", "open", "closed", "home", "not_home", "locked", "unlocked", "playing", "paused", "idle"];
+    return `<datalist id="dl-services">${services.join("")}</datalist>
+      <datalist id="dl-states">${states.map((v) => `<option value="${v}"></option>`).join("")}</datalist>`;
   }
 
   // ---------- entity picker ----------
@@ -2265,8 +2928,11 @@ class KeypadBuilderPanel extends HTMLElement {
     let values = [];
     if (pickId === "led") {
       values = s.led?.entity ? [s.led.entity] : [];
+    } else if (pickId.startsWith("cond-")) {
+      const cond = this._getCond(pickId.slice(5));
+      values = cond?.entity ? [cond.entity] : [];
     } else {
-      const row = s.rows[Number(pickId.slice(4))];
+      const row = this._getRow(pickId.slice(4));
       if (!row) return;
       values = [...(row.entities || [])];
       const preset = row.kind === "service" ? presetFor(row.service) : null;
@@ -2274,7 +2940,7 @@ class KeypadBuilderPanel extends HTMLElement {
       domains = preset && !led ? preset.domains : null;
     }
     // action steps can control several things at once; the LED follows just one
-    const multi = pickId !== "led";
+    const multi = pickId.startsWith("row-");
     this._picker = { pickId, domains, led, multi, value: values[0] || "", selected: values, q: "", area: "", type: "" };
     this._render();
     this.shadowRoot.querySelector("#pick-q")?.focus();
@@ -2303,8 +2969,12 @@ class KeypadBuilderPanel extends HTMLElement {
     if (pickId === "led") {
       s.led.entity = values[0] || "";
       s.ledDirty = true;
+    } else if (pickId.startsWith("cond-")) {
+      this._getCond(pickId.slice(5)).entity = values[0] || "";
+      s.dirty = true;
+      s.msg = null;
     } else {
-      s.rows[Number(pickId.slice(4))].entities = values;
+      this._getRow(pickId.slice(4)).entities = values;
       s.dirty = true;
       s.msg = null;
     }
@@ -2360,7 +3030,13 @@ class KeypadBuilderPanel extends HTMLElement {
       .sort((a, b) => domainLabel(a).replace(/^\W+/, "").localeCompare(domainLabel(b).replace(/^\W+/, "")))
       .map((t) => `<button class="tchip ${p.type === t ? "on" : ""}" data-act="pick-type" data-type="${esc(t)}">${esc(domainLabel(t))}</button>`)
       .join("");
-    const title = p.led ? "Choose keypad LEDs" : p.pickId === "led" ? "What should the LED follow?" : "Choose what to control";
+    const title = p.led
+      ? "Choose keypad LEDs"
+      : p.pickId === "led"
+        ? "What should the LED follow?"
+        : p.pickId.startsWith("cond-")
+          ? "Which device should it check?"
+          : "Choose what to control";
 
     return `
       <div class="picker-backdrop" data-act="pick-close"></div>
@@ -2565,6 +3241,39 @@ const STYLES = `
   }
   .ef-chip.more { background: var(--kb-border); }
   .picker.wide { width: min(780px, calc(100vw - 32px)); }
+  .fields { display: flex; flex-direction: column; gap: 6px; }
+  .blk { display: flex; flex-direction: column; gap: 8px; }
+  .blk-label {
+    display: flex; align-items: center; gap: 10px; margin-top: 4px;
+    font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .07em; color: var(--kb-accent);
+  }
+  .blk-option { display: flex; flex-direction: column; gap: 8px; padding: 10px; border: 1px dashed var(--kb-border); border-radius: 12px; }
+  .rows.nested { margin: 0; padding-left: 10px; border-left: 2px solid color-mix(in srgb, var(--kb-accent) 40%, transparent); }
+  .add.add-small { padding: 6px; font-size: 13px; }
+  .conds { display: flex; flex-direction: column; gap: 6px; }
+  .conds .match { align-self: flex-start; }
+  .cond { display: flex; flex-direction: column; gap: 6px; padding: 8px; border-radius: 10px; background: color-mix(in srgb, var(--kb-text) 4%, transparent); }
+  .cond-head { display: flex; gap: 6px; align-items: center; }
+  .cond-head select { flex: 1; }
+  .inline label.mini { min-width: 0; }
+  .day-chips { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+  .day-chips .tchip { padding: 3px 9px; font-size: 12px; }
+  .row.block-row { border-color: color-mix(in srgb, var(--kb-accent) 35%, var(--kb-border)); }
+  .fields-title { font-size: 12px; color: var(--kb-muted); text-transform: uppercase; letter-spacing: .06em; }
+  .field-row { display: flex; gap: 6px; align-items: center; }
+  .field-row input { flex: 1; }
+  .target-chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .target-chip { display: inline-flex; align-items: center; gap: 4px; }
+  .chip-x { border: none; background: none; color: var(--kb-muted); padding: 0 0 0 2px; font-size: 11px; }
+  .chip-x:hover { color: var(--kb-error); }
+  .block-summary { padding: 10px 12px; border-radius: 12px; background: color-mix(in srgb, var(--kb-accent) 6%, transparent); border: 1px solid var(--kb-border); }
+  .desc { display: flex; flex-direction: column; gap: 4px; }
+  .desc-line { font-size: 14px; line-height: 1.35; }
+  .desc-sub { display: block; font-size: 12px; color: var(--kb-muted); margin-left: 22px; }
+  .desc-group { margin-left: 12px; padding-left: 10px; border-left: 2px solid var(--kb-border); display: flex; flex-direction: column; gap: 4px; }
+  .desc-label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--kb-muted); margin-top: 2px; }
+  .json-details summary { cursor: pointer; font-size: 12px; color: var(--kb-muted); }
+  .json-details textarea { margin-top: 6px; }
   .picker-filters input { flex: 2; min-width: 180px; }
   .type-chips { display: flex; flex-wrap: wrap; gap: 6px; }
   .tchip { border: 1px solid var(--kb-border); background: none; border-radius: 999px; padding: 5px 11px; font-size: 13px; }

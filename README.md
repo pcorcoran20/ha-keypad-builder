@@ -31,9 +31,13 @@ Pick a keypad → tap a button on the faceplate → choose what it does → **Sa
 
 ### Actions you can pick
 
-Toggle · Turn on · Turn off · Set light brightness (with fade) · Activate scene · Run script · Run another automation · Keypad LED on/off/toggle · Open/close/stop shade · Play/pause · Volume up/down · Wait · Custom action (any action + JSON data)
+Toggle · Turn on · Turn off · Set light brightness (with fade) · Activate scene · Run script · Run another automation · Keypad LED on/off/toggle · Open/close/stop shade · Play/pause · Volume up/down · Wait · Custom action (any action + settings)
 
-Steps the builder doesn't understand (like `choose` blocks you added in the HA editor) are shown as JSON and kept as-is.
+### Logic blocks
+
+🔀 If / then / otherwise · 🔀 Choose · 🔁 Repeat · ✋ Only keep going if… with conditions for devices, numbers, sun and time/day. Blocks can go inside blocks.
+
+Automations made in Home Assistant's own editor show up as normal steps. Anything too fancy for the builder shows as a readable summary you can open in HA's editor.
 
 ## About pulling from the RA3 program
 
